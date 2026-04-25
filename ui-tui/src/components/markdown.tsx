@@ -97,19 +97,39 @@ export const stripInlineMarkup = (v: string) =>
 const renderTable = (k: number, rows: string[][], t: Theme) => {
   const widths = rows[0]!.map((_, ci) => Math.max(...rows.map(r => stripInlineMarkup(r[ci] ?? '').length)))
 
+  const borderColor = t.color.dim
+  const divider = (
+    <Box key={`${k}-div`}>
+      <Text color={borderColor}>{'├─'}{widths.map(w => '─'.repeat(w)).join('─┼─')}{'─┤'}</Text>
+    </Box>
+  )
+
+  const tableRows: ReactNode[] = []
+  for (let ri = 0; ri < rows.length; ri++) {
+    const row = rows[ri]!
+    const cells: ReactNode[] = []
+    cells.push(<Text color={borderColor} key="eL">{'│ '}</Text>)
+    for (let ci = 0; ci < widths.length; ci++) {
+      if (ci > 0) {
+        cells.push(<Text color={borderColor} key={`p${ci}`}>{' │ '}</Text>)
+      }
+      cells.push(
+        <Text color={ri === 0 ? t.color.amber : undefined} key={`c${ci}`}>
+          <MdInline t={t} text={row[ci] ?? ''} />
+          {' '.repeat(Math.max(0, widths[ci]! - stripInlineMarkup(row[ci] ?? '').length))}
+        </Text>
+      )
+    }
+    cells.push(<Text color={borderColor} key="eR">{' │'}</Text>)
+    tableRows.push(<Box key={ri}>{cells}</Box>)
+    if (ri === 0) {
+      tableRows.push(divider)
+    }
+  }
+
   return (
     <Box flexDirection="column" key={k} paddingLeft={2}>
-      {rows.map((row, ri) => (
-        <Box key={ri}>
-          {widths.map((w, ci) => (
-            <Text color={ri === 0 ? t.color.amber : undefined} key={ci}>
-              <MdInline t={t} text={row[ci] ?? ''} />
-              {' '.repeat(Math.max(0, w - stripInlineMarkup(row[ci] ?? '').length))}
-              {ci < widths.length - 1 ? '  ' : ''}
-            </Text>
-          ))}
-        </Box>
-      ))}
+      {tableRows}
     </Box>
   )
 }
