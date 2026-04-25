@@ -4555,6 +4555,40 @@ class AIAgent:
             filtered.append(msg)
         messages = filtered
 
+        # Pass 0: strip tool_calls whose function.name is empty/missing.
+        # Some providers (and partially-streamed responses) emit a tool_call
+        # with id="call_xxx" but function.name="".  Downstream adapters
+        # (notably _chat_messages_to_responses_input) silently drop such
+        # function_call items while still emitting the matching
+        # function_call_output, producing the gateway's
+        #   "No tool call found for function call output with call_id ..."
+        # 400 error.  Drop the malformed call here so the orphan-result
+        # logic below correctly removes its (now unpaired) tool result.
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            tcs = msg.get("tool_calls") or []
+            if not tcs:
+                continue
+            cleaned = []
+            for tc in tcs:
+                if isinstance(tc, dict):
+                    fn = tc.get("function") or {}
+                    name = fn.get("name")
+                else:
+                    fn = getattr(tc, "function", None)
+                    name = getattr(fn, "name", None) if fn else None
+                if not isinstance(name, str) or not name.strip():
+                    logger.warning(
+                        "Pre-call sanitizer: dropping tool_call with empty "
+                        "function.name (id=%s)",
+                        AIAgent._get_tool_call_id_static(tc),
+                    )
+                    continue
+                cleaned.append(tc)
+            if len(cleaned) != len(tcs):
+                msg["tool_calls"] = cleaned
+
         surviving_call_ids: set = set()
         for msg in messages:
             if msg.get("role") == "assistant":

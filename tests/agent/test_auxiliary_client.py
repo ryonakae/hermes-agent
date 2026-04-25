@@ -259,6 +259,64 @@ class TestAnthropicOAuthFlag:
         assert mock_build.call_args.args[0] == "sk-ant-oat01-pooled"
 
 
+class TestCodexCompletionsAdapter:
+    def test_converts_tool_messages_to_responses_function_call_output(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        captured = {}
+
+        class _Stream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter(())
+
+            def get_final_response(self):
+                response = MagicMock()
+                response.output = []
+                response.usage = None
+                return response
+
+        class _Responses:
+            def stream(self, **kwargs):
+                captured.update(kwargs)
+                return _Stream()
+
+        real_client = MagicMock()
+        real_client.responses = _Responses()
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.2-codex")
+
+        adapter.create(
+            messages=[
+                {"role": "user", "content": "Use the tool"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {"name": "memory", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_123", "content": "saved"},
+                {"role": "user", "content": "continue"},
+            ]
+        )
+
+        assert {"role": "tool", "content": "saved"} not in captured["input"]
+        assert {
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": "saved",
+        } in captured["input"]
+
+
 class TestTryCodex:
     def test_pool_without_selected_entry_falls_back_to_auth_store(self):
         with (
