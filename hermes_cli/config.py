@@ -657,6 +657,8 @@ DEFAULT_CONFIG = {
         "tool_progress_overrides": {},  # DEPRECATED — use display.platforms instead
         "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
         "platforms": {},  # Per-platform display overrides: {"telegram": {"tool_progress": "all"}, "slack": {"tool_progress": "off"}}
+        # When True, dangerous-command approval uses stdin text prompts instead of the full-screen panel (helps SSH/Docker/WSL PTY edge cases).
+        "tui_simple_approval": False,
     },
 
     # Web dashboard settings

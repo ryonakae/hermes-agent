@@ -2116,6 +2116,7 @@ class HermesCLI:
         self._approval_state = None
         self._approval_deadline = 0
         self._approval_lock = threading.Lock()
+        self._tui_render_lock = threading.RLock()
         self._model_picker_state = None
         self._secret_state = None
         self._secret_deadline = 0
@@ -2147,6 +2148,34 @@ class HermesCLI:
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
+
+    def _tui_modal_active(self) -> bool:
+        """True while a full-screen prompt_toolkit modal (approval, sudo, etc.) owns the UI."""
+        return bool(
+            self._approval_state
+            or self._sudo_state
+            or self._clarify_state
+            or self._secret_state
+            or self._model_picker_state
+            or getattr(self, "_clarify_freetext", False)
+        )
+
+    def _want_simple_approval_prompt(self) -> bool:
+        """Use plain stdin approval (no overlay) — SSH/Docker/WSL or explicit opt-in."""
+        import os as _os
+
+        flag = (_os.environ.get("HERMES_TUI_SIMPLE_APPROVAL") or "").strip().lower()
+        if flag in ("1", "true", "yes", "on"):
+            return True
+        try:
+            from hermes_cli.config import load_config
+
+            display = load_config().get("display") or {}
+            if not isinstance(display, dict):
+                return False
+            return bool(display.get("tui_simple_approval"))
+        except Exception:
+            return False
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
@@ -8010,9 +8039,25 @@ class HermesCLI:
         parallel delegation subtasks) so each prompt gets its own turn
         and the shared _approval_state / _approval_deadline aren't clobbered.
         """
+        import os as _os
         import time as _time
 
         with self._approval_lock:
+            if self._want_simple_approval_prompt():
+                _os.environ["HERMES_SPINNER_PAUSE"] = "1"
+                try:
+                    from tools.approval import prompt_dangerous_approval
+
+                    return prompt_dangerous_approval(
+                        command,
+                        description,
+                        allow_permanent=allow_permanent,
+                        approval_callback=None,
+                    )
+                finally:
+                    _os.environ.pop("HERMES_SPINNER_PAUSE", None)
+                    self._invalidate(min_interval=0.0)
+
             timeout = 60
             response_queue = queue.Queue()
 
@@ -8556,7 +8601,10 @@ class HermesCLI:
                         # StdoutProxy buffer only flushes on renderer passes
                         # triggered by input events — on macOS this causes
                         # the CLI to appear frozen until the user types. (#1624)
-                        self._invalidate(min_interval=0.15)
+                        import os as _os
+
+                        if not self._tui_modal_active() and not _os.environ.get("HERMES_SPINNER_PAUSE"):
+                            self._invalidate(min_interval=0.15)
                 else:
                     # Fallback for non-interactive mode (e.g., single-query)
                     agent_thread.join(0.1)
@@ -10526,6 +10574,14 @@ class HermesCLI:
         )
         self._app = app  # Store reference for clarify_callback
 
+        _orig_app_invalidate = app.invalidate
+
+        def _locked_app_invalidate(*args, **kwargs):
+            with self._tui_render_lock:
+                return _orig_app_invalidate(*args, **kwargs)
+
+        app.invalidate = _locked_app_invalidate  # Serialize repaints vs agent/tool threads (#TUI UX pack)
+
         # ── Fix ghost status-bar lines on terminal resize ──────────────
         # When the terminal shrinks (e.g. un-maximize), the emulator reflows
         # the previously-rendered full-width rows (status bar, input rules)
@@ -10574,6 +10630,14 @@ class HermesCLI:
             while not self._should_exit:
                 if not self._app:
                     time.sleep(0.1)
+                    continue
+                # Pause background refreshes while plain stdin approval / sudo prompts run (tools/approval.py)
+                if os.environ.get("HERMES_SPINNER_PAUSE"):
+                    time.sleep(0.15)
+                    continue
+                # Avoid racing the approval / clarify / sudo overlay with idle status-bar ticks (#12312-class freeze)
+                if self._tui_modal_active():
+                    _time.sleep(0.15)
                     continue
                 if self._command_running:
                     self._invalidate(min_interval=0.1)
