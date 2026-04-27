@@ -1329,6 +1329,28 @@ def list_available_providers() -> list[dict[str, str]]:
             "aliases": alias_list,
             "authenticated": has_creds,
         })
+
+    # Append user-defined custom providers from config.yaml
+    try:
+        from hermes_cli.config import get_compatible_custom_providers
+        seen_ids = {entry["id"] for entry in result}
+        for cp in get_compatible_custom_providers():
+            cp_name = cp.get("name", "")
+            if not cp_name:
+                continue
+            cp_id = f"custom:{cp_name}"
+            if cp_id in seen_ids:
+                continue
+            seen_ids.add(cp_id)
+            result.append({
+                "id": cp_id,
+                "label": cp_name,
+                "aliases": [],
+                "authenticated": True,
+            })
+    except Exception:
+        pass
+
     return result
 
 

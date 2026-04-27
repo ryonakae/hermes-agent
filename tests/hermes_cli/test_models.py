@@ -6,6 +6,7 @@ from hermes_cli.models import (
     OPENROUTER_MODELS, fetch_openrouter_models, model_ids, detect_provider_for_model,
     is_nous_free_tier, partition_nous_models_by_tier,
     check_nous_free_tier, _FREE_TIER_CACHE_TTL,
+    list_available_providers,
 )
 import hermes_cli.models as _models_mod
 
@@ -615,3 +616,54 @@ class TestNousRecommendedModels:
             patch("hermes_cli.models.check_nous_free_tier", side_effect=RuntimeError("boom")),
         ):
             assert get_nous_recommended_aux_model(vision=False) == "paid-model"
+
+
+class TestListAvailableProvidersCustom:
+    """list_available_providers includes user-defined custom providers from config."""
+
+    _FAKE_CUSTOM_PROVIDERS = [
+        {"name": "local-llama", "base_url": "http://localhost:11434/v1"},
+        {"name": "my-server", "base_url": "https://my.server.example/v1"},
+    ]
+
+    @patch("hermes_cli.config.get_compatible_custom_providers", return_value=[])
+    def test_no_custom_providers(self, _mock_gcp):
+        providers = list_available_providers()
+        ids = [p["id"] for p in providers]
+        assert "custom" in ids
+        assert not any(pid.startswith("custom:") for pid in ids)
+
+    @patch("hermes_cli.config.get_compatible_custom_providers")
+    def test_custom_providers_appended(self, mock_gcp):
+        mock_gcp.return_value = self._FAKE_CUSTOM_PROVIDERS
+        providers = list_available_providers()
+        ids = [p["id"] for p in providers]
+        assert "custom:local-llama" in ids
+        assert "custom:my-server" in ids
+
+    @patch("hermes_cli.config.get_compatible_custom_providers")
+    def test_custom_providers_marked_authenticated(self, mock_gcp):
+        mock_gcp.return_value = self._FAKE_CUSTOM_PROVIDERS
+        providers = list_available_providers()
+        by_id = {p["id"]: p for p in providers}
+        assert by_id["custom:local-llama"]["authenticated"] is True
+        assert by_id["custom:my-server"]["authenticated"] is True
+
+    @patch("hermes_cli.config.get_compatible_custom_providers")
+    def test_custom_providers_no_duplicates(self, mock_gcp):
+        mock_gcp.return_value = [
+            {"name": "dup", "base_url": "http://a.test/v1"},
+            {"name": "dup", "base_url": "http://b.test/v1"},
+        ]
+        providers = list_available_providers()
+        dup_count = sum(1 for p in providers if p["id"] == "custom:dup")
+        assert dup_count == 1
+
+    @patch(
+        "hermes_cli.config.get_compatible_custom_providers",
+        side_effect=RuntimeError("config broken"),
+    )
+    def test_config_error_does_not_crash(self, _mock_gcp):
+        providers = list_available_providers()
+        assert isinstance(providers, list)
+        assert len(providers) > 0
