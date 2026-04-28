@@ -169,6 +169,12 @@ function ScrollBox({ children, ref, stickyScroll, ...style }: PropsWithChildren<
         el.stickyScroll = false
         manualScrollAtRef.current = Date.now()
         el.scrollAnchor = undefined
+
+        // Mark recent scroll-up to prevent sticky re-activation.
+        if (dy < 0) {
+          el.recentScrollUpTime = Date.now()
+        }
+
         el.pendingScrollDelta = (el.pendingScrollDelta ?? 0) + Math.floor(dy)
         scrollMutated(el)
       },
@@ -181,6 +187,8 @@ function ScrollBox({ children, ref, stickyScroll, ...style }: PropsWithChildren<
 
         el.pendingScrollDelta = undefined
         el.stickyScroll = true
+        // Clear recentScrollUpTime since we're explicitly going to bottom.
+        el.recentScrollUpTime = undefined
         markDirty(el)
         notify()
         forceRender(n => n + 1)

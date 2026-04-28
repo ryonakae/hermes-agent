@@ -73,6 +73,10 @@ export type DOMElement = {
   scrollViewportTop?: number
   stickyScroll?: boolean
   notifyScrollChange?: () => void
+  // Timestamp of last manual scroll-up (negative scrollBy). Used to
+  // prevent stickyScroll from re-activating immediately after user
+  // scrolls up. Expires after 500ms or next scrollToBottom.
+  recentScrollUpTime?: number
   // Set by ScrollBox.scrollToElement; render-node-to-output reads
   // el.yogaNode.getComputedTop() (FRESH — same Yoga pass as scrollHeight)
   // and sets scrollTop = top + offset, then clears this. Unlike an
