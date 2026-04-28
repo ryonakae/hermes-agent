@@ -307,9 +307,14 @@ def proxy_kwargs_for_aiohttp(proxy_url: str | None) -> tuple[dict, dict]:
     """Build kwargs for standalone ``aiohttp.ClientSession`` with proxy.
 
     Returns ``(session_kwargs, request_kwargs)`` where:
-      - SOCKS → ``({"connector": ProxyConnector(...)}, {})``
-      - HTTP  → ``({}, {"proxy": url})``
-      - None  → ``({}, {})``
+      - With aiohttp-socks → ``({"connector": ProxyConnector(...)}, {})``
+        for *all* proxy schemes (SOCKS **and** HTTP/HTTPS).
+      - HTTP without aiohttp-socks → ``({}, {"proxy": url})``.
+      - None → ``({}, {})``.
+
+    Prefer the connector path: it works transparently with libraries
+    (like mautrix) that call ``session.request()`` without forwarding
+    per-request ``proxy=`` kwargs.
 
     Usage::
 
@@ -320,20 +325,20 @@ def proxy_kwargs_for_aiohttp(proxy_url: str | None) -> tuple[dict, dict]:
     """
     if not proxy_url:
         return {}, {}
-    if proxy_url.lower().startswith("socks"):
-        try:
-            from aiohttp_socks import ProxyConnector
+    try:
+        from aiohttp_socks import ProxyConnector
 
-            connector = ProxyConnector.from_url(proxy_url, rdns=True)
-            return {"connector": connector}, {}
-        except ImportError:
+        connector = ProxyConnector.from_url(proxy_url, rdns=True)
+        return {"connector": connector}, {}
+    except ImportError:
+        if proxy_url.lower().startswith("socks"):
             logger.warning(
                 "aiohttp_socks not installed — SOCKS proxy %s ignored. "
                 "Run: pip install aiohttp-socks",
                 proxy_url,
             )
             return {}, {}
-    return {}, {"proxy": proxy_url}
+        return {}, {"proxy": proxy_url}
 
 
 def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = None) -> bool:
@@ -2427,11 +2432,15 @@ class BasePlatformAdapter(ABC):
                 # Send the text portion
                 if text_content:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
+                    # Build send metadata: thread_id + mention target for platforms that need it
+                    send_metadata = dict(_thread_metadata) if _thread_metadata else {}
+                    if event.source.user_id:
+                        send_metadata["mention_user_id"] = event.source.user_id
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=event.message_id,
-                        metadata=_thread_metadata,
+                        metadata=send_metadata,
                     )
                     _record_delivery(result)
 
