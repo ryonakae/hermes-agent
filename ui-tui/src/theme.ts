@@ -49,6 +49,11 @@ export interface Theme {
   bannerHero: string
 }
 
+export interface FromSkinOptions {
+  env?: NodeJS.ProcessEnv
+  lightMode?: boolean
+}
+
 // ── Color math ───────────────────────────────────────────────────────
 
 function parseHex(h: string): [number, number, number] | null {
@@ -76,6 +81,94 @@ function mix(a: string, b: string, t: number) {
   return '#' + ((1 << 24) | (lerp(0) << 16) | (lerp(1) << 8) | lerp(2)).toString(16).slice(1)
 }
 
+function relativeLuminance(h: string): number | null {
+  const rgb = parseHex(h)
+
+  if (!rgb) {
+    return null
+  }
+
+  const linear = rgb.map((v) => {
+    const c = v / 255
+
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4
+  }) as [number, number, number]
+
+  return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+}
+
+export function contrastRatio(foreground: string, background: string): number {
+  const fg = relativeLuminance(foreground)
+  const bg = relativeLuminance(background)
+
+  // Invalid colors are treated as worst-case contrast. This keeps typos in a
+  // skin from masquerading as readable simply because parsing failed.
+  if (fg === null || bg === null) {
+    return 1
+  }
+
+  const light = Math.max(fg, bg)
+  const dark = Math.min(fg, bg)
+
+  return (light + 0.05) / (dark + 0.05)
+}
+
+function ensureContrast(foreground: string, background: string, minimum = 4.5): string {
+  if (contrastRatio(foreground, background) >= minimum) {
+    return foreground
+  }
+
+  if (relativeLuminance(background) === null) {
+    return foreground
+  }
+
+  const blackRatio = contrastRatio('#000000', background)
+  const whiteRatio = contrastRatio('#FFFFFF', background)
+  const target = blackRatio >= whiteRatio ? '#000000' : '#FFFFFF'
+
+  if (relativeLuminance(foreground) === null) {
+    return target
+  }
+
+  for (let i = 1; i <= 20; i += 1) {
+    const candidate = mix(foreground, target, i / 20)
+
+    if (contrastRatio(candidate, background) >= minimum) {
+      return candidate
+    }
+  }
+
+  return target
+}
+
+function minContrast(background: string, foregrounds: string[]): number {
+  return Math.min(...foregrounds.map((foreground) => contrastRatio(foreground, background)))
+}
+
+function ensureBackgroundContrast(background: string, foregrounds: string[], minimum = 4.5): string {
+  if (relativeLuminance(background) === null) {
+    return background
+  }
+
+  if (minContrast(background, foregrounds) >= minimum) {
+    return background
+  }
+
+  const blackRatio = minContrast('#000000', foregrounds)
+  const whiteRatio = minContrast('#FFFFFF', foregrounds)
+  const target = blackRatio >= whiteRatio ? '#000000' : '#FFFFFF'
+
+  for (let i = 1; i <= 20; i += 1) {
+    const candidate = mix(background, target, i / 20)
+
+    if (minContrast(candidate, foregrounds) >= minimum) {
+      return candidate
+    }
+  }
+
+  return target
+}
+
 // ── Defaults ─────────────────────────────────────────────────────────
 
 const BRAND: ThemeBrand = {
@@ -100,8 +193,8 @@ export const DARK_THEME: Theme = {
     // secondary" semantic.  Field labels still use `label` (65%) which
     // stays brighter so hierarchy holds.
     dim: '#CC9B1F',
-    completionBg: '#FFFFFF',
-    completionCurrentBg: mix('#FFFFFF', '#FFBF00', 0.25),
+    completionBg: '#10161D',
+    completionCurrentBg: '#322A16',
 
     label: '#DAA520',
     ok: '#4caf50',
@@ -147,7 +240,7 @@ export const LIGHT_THEME: Theme = {
     cornsilk: '#3D2F13',
     dim: '#7A5A0F',
     completionBg: '#F5F5F5',
-    completionCurrentBg: mix('#F5F5F5', '#A0651C', 0.25),
+    completionCurrentBg: '#FFF8DC',
 
     label: '#7A5A0F',
     ok: '#2E7D32',
@@ -193,62 +286,108 @@ export function detectLightMode(env: NodeJS.ProcessEnv = process.env): boolean {
     return false
   }
 
-  const bg = Number((env.COLORFGBG ?? '').trim().split(';').at(-1))
+  const parts = (env.COLORFGBG ?? '').trim().split(';')
+  const bg = Number(parts[parts.length - 1])
 
   return bg === 7 || bg === 15
 }
 
 export const DEFAULT_THEME: Theme = detectLightMode() ? LIGHT_THEME : DARK_THEME
 
+function themeFor(lightMode: boolean): Theme {
+  return lightMode ? LIGHT_THEME : DARK_THEME
+}
+
 // ── Skin → Theme ─────────────────────────────────────────────────────
 
+// Skins are user-customizable, but the TUI must remain readable when macOS flips
+// the terminal between light and dark appearances. fromSkin therefore treats
+// invalid or low-contrast skin colors as requests to stay visually close while
+// meeting the relevant foreground/background contrast threshold.
 export function fromSkin(
   colors: Record<string, string>,
   branding: Record<string, string>,
   bannerLogo = '',
   bannerHero = '',
   toolPrefix = '',
-  helpHeader = ''
+  helpHeader = '',
+  options: FromSkinOptions = {}
 ): Theme {
-  const d = DEFAULT_THEME
+  const lightMode = options.lightMode ?? detectLightMode(options.env)
+  const d = themeFor(lightMode)
+  // Terminals do not expose an exact background color to Node. Use the Hermes
+  // dark surface and plain white as conservative contrast targets for the two
+  // appearance modes; custom skin surfaces are checked separately below.
+  const terminalBg = lightMode ? '#FFFFFF' : '#10161D'
   const c = (k: string) => colors[k]
+  const onTerminal = (value: string, minimum = 4.5) => ensureContrast(value, terminalBg, minimum)
+  const onBg = (value: string, bg: string, minimum = 4.5) => ensureContrast(value, bg, minimum)
 
-  const amber = c('ui_accent') ?? c('banner_accent') ?? d.color.amber
-  const accent = c('banner_accent') ?? c('banner_title') ?? d.color.amber
-  const dim = c('banner_dim') ?? d.color.dim
+  const terminalColor = (value: string | undefined, fallback: string, minimum = 4.5) =>
+    value ? onTerminal(value, minimum) : fallback
+
+  const backgroundColor = (value: string | undefined, fallback: string, foregrounds: string[], minimum = 4.5) => {
+    const background = value && relativeLuminance(value) !== null ? value : fallback
+
+    return ensureBackgroundContrast(background, foregrounds, minimum)
+  }
+
+  const surfaceColor = (value: string | undefined, fallback: string, bg: string, fallbackBg: string, minimum = 4.5) =>
+    // Empty strings are treated as absent skin values; only real values or an
+    // explicit surface change trigger contrast correction against the surface.
+    (value || bg !== fallbackBg) ? onBg(value ?? fallback, bg, minimum) : fallback
+
+  // Text-like values use WCAG AA 4.5:1 by default; borders and deliberately
+  // muted secondary text can sit lower because they are hierarchy/decoration,
+  // not the only readable content.
+  const amber = c('ui_accent') ?? c('banner_accent')
+  const dim = c('banner_dim')
+  const label = terminalColor(c('ui_label'), d.color.label)
+  const readableDim = terminalColor(dim, d.color.dim, 3.8)
+
+  const completionBg = backgroundColor(c('completion_menu_bg'), d.color.completionBg, [label, readableDim])
+
+  const completionCurrentBg = backgroundColor(
+    c('completion_menu_current_bg'),
+    d.color.completionCurrentBg,
+    [label, readableDim]
+  )
+
+  const statusBgValue = c('status_bar_bg')
+  const statusBg = statusBgValue && relativeLuminance(statusBgValue) !== null ? statusBgValue : d.color.statusBg
 
   return {
     color: {
-      gold: c('banner_title') ?? d.color.gold,
-      amber,
-      bronze: c('banner_border') ?? d.color.bronze,
-      cornsilk: c('banner_text') ?? d.color.cornsilk,
-      dim,
-      completionBg: c('completion_menu_bg') ?? '#FFFFFF',
-      completionCurrentBg: c('completion_menu_current_bg') ?? mix('#FFFFFF', accent, 0.25),
+      gold: terminalColor(c('banner_title'), d.color.gold),
+      amber: terminalColor(amber, d.color.amber),
+      bronze: terminalColor(c('banner_border'), d.color.bronze, 3),
+      cornsilk: terminalColor(c('banner_text'), d.color.cornsilk),
+      dim: readableDim,
+      completionBg,
+      completionCurrentBg,
 
-      label: c('ui_label') ?? d.color.label,
-      ok: c('ui_ok') ?? d.color.ok,
-      error: c('ui_error') ?? d.color.error,
-      warn: c('ui_warn') ?? d.color.warn,
+      label,
+      ok: terminalColor(c('ui_ok'), d.color.ok),
+      error: terminalColor(c('ui_error'), d.color.error),
+      warn: terminalColor(c('ui_warn'), d.color.warn),
 
-      prompt: c('prompt') ?? c('banner_text') ?? d.color.prompt,
-      sessionLabel: c('session_label') ?? dim,
-      sessionBorder: c('session_border') ?? dim,
+      prompt: terminalColor(c('prompt') ?? c('banner_text'), d.color.prompt),
+      sessionLabel: terminalColor(c('session_label') ?? dim, d.color.sessionLabel, 3.8),
+      sessionBorder: terminalColor(c('session_border') ?? dim, d.color.sessionBorder, 3),
 
-      statusBg: d.color.statusBg,
-      statusFg: d.color.statusFg,
-      statusGood: c('ui_ok') ?? d.color.statusGood,
-      statusWarn: c('ui_warn') ?? d.color.statusWarn,
-      statusBad: d.color.statusBad,
-      statusCritical: d.color.statusCritical,
+      statusBg,
+      statusFg: surfaceColor(c('status_bar_text') ?? c('banner_text'), d.color.statusFg, statusBg, d.color.statusBg),
+      statusGood: surfaceColor(c('status_bar_good') ?? c('ui_ok'), d.color.statusGood, statusBg, d.color.statusBg),
+      statusWarn: surfaceColor(c('status_bar_warn') ?? c('ui_warn'), d.color.statusWarn, statusBg, d.color.statusBg),
+      statusBad: surfaceColor(c('status_bar_bad'), d.color.statusBad, statusBg, d.color.statusBg),
+      statusCritical: surfaceColor(c('status_bar_critical'), d.color.statusCritical, statusBg, d.color.statusBg),
       selectionBg: c('selection_bg') ?? d.color.selectionBg,
 
       diffAdded: d.color.diffAdded,
       diffRemoved: d.color.diffRemoved,
       diffAddedWord: d.color.diffAddedWord,
       diffRemovedWord: d.color.diffRemovedWord,
-      shellDollar: c('shell_dollar') ?? d.color.shellDollar
+      shellDollar: terminalColor(c('shell_dollar'), d.color.shellDollar)
     },
 
     brand: {
