@@ -474,4 +474,42 @@ describe('createGatewayEventHandler', () => {
 
     expect(getTurnState().activity).toMatchObject([{ text: 'boom', tone: 'error' }])
   })
+
+  it('drops stale reasoning/tool events after ctrl-c until the next message starts', () => {
+    // Repro for the discord report: ctrl-c interrupts, but late reasoning/tool
+    // events from the still-winding-down agent loop kept populating the UI for
+    // ~1s, making it look like the interrupt had been ignored.
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    ctx.gateway.gw.request = vi.fn(async () => ({ status: 'interrupted' }))
+    const onEvent = createGatewayEventHandler(ctx)
+
+    patchUiState({ sid: 'sess-1' })
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({ payload: { context: 'pre', name: 'search', tool_id: 't-1' }, type: 'tool.start' } as any)
+
+    turnController.interruptTurn({
+      appendMessage: (msg: Msg) => appended.push(msg),
+      gw: ctx.gateway.gw,
+      sid: 'sess-1',
+      sys: ctx.system.sys
+    })
+
+    onEvent({ payload: { text: 'still thinking…' }, type: 'reasoning.delta' } as any)
+    onEvent({ payload: { context: 'post', name: 'browser', tool_id: 't-2' }, type: 'tool.start' } as any)
+    onEvent({ payload: { name: 'browser', preview: 'loading' }, type: 'tool.progress' } as any)
+    onEvent({ payload: { summary: 'done', tool_id: 't-2' }, type: 'tool.complete' } as any)
+    onEvent({ payload: { text: 'late chunk' }, type: 'message.delta' } as any)
+
+    expect(getTurnState().tools).toEqual([])
+    expect(turnController.reasoningText).toBe('')
+    expect(turnController.bufRef).toBe('')
+    expect(getTurnState().streamPendingTools).toEqual([])
+    expect(getTurnState().streamSegments).toEqual([])
+
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({ payload: { text: 'fresh' }, type: 'reasoning.delta' } as any)
+
+    expect(turnController.reasoningText).toBe('fresh')
+  })
 })
