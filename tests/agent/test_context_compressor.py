@@ -242,6 +242,72 @@ class TestSummaryFailureCooldown:
         assert mock_call.call_count == 1
 
 
+class TestSummaryFailureTrackingForGatewayWarning:
+    """When summary generation fails, the compressor must record dropped count
+    + fallback flag so gateway hygiene & /compress can surface a visible
+    warning instead of silently dropping context."""
+
+    def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "msg 1"},
+            {"role": "assistant", "content": "msg 2"},
+            {"role": "user", "content": "msg 3"},
+            {"role": "assistant", "content": "msg 4"},
+            {"role": "user", "content": "msg 5"},
+            {"role": "assistant", "content": "msg 6"},
+            {"role": "user", "content": "msg 7"},
+        ]
+
+        # Simulate summary LLM call failing — covers the 404 / model-not-found
+        # case from issue (auxiliary compression model misconfigured).
+        with patch("agent.context_compressor.call_llm", side_effect=Exception("404 model not found")):
+            result = c.compress(msgs)
+
+        assert c._last_summary_fallback_used is True
+        assert c._last_summary_dropped_count > 0
+        assert c._last_summary_error is not None
+        # Result must still be well-formed (fallback summary present).
+        assert any(
+            isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
+            for m in result
+        )
+
+    def test_compress_clears_fallback_flag_on_subsequent_success(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "msg 1"},
+            {"role": "assistant", "content": "msg 2"},
+            {"role": "user", "content": "msg 3"},
+            {"role": "assistant", "content": "msg 4"},
+            {"role": "user", "content": "msg 5"},
+            {"role": "assistant", "content": "msg 6"},
+            {"role": "user", "content": "msg 7"},
+        ]
+
+        # First call fails, second succeeds — flag must reset on second compress.
+        with patch("agent.context_compressor.call_llm", side_effect=Exception("boom")):
+            c.compress(msgs)
+        assert c._last_summary_fallback_used is True
+
+        # Reset cooldown to allow retry on second compress
+        c._summary_failure_cooldown_until = 0.0
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            c.compress(msgs)
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
+
+
 class TestSummaryPrefixNormalization:
     def test_legacy_prefix_is_replaced(self):
         summary = ContextCompressor._with_summary_prefix("[CONTEXT SUMMARY]: did work")
@@ -845,6 +911,97 @@ class TestTokenBudgetTailProtection:
         # Tool at index 2 is outside the protected tail (last 3 = indices 2,3,4)
         # so it might or might not be pruned depending on boundary
         assert isinstance(pruned, int)
+
+    def test_multimodal_message_accumulates_text_chars_not_block_count(self, budget_compressor):
+        """_find_tail_cut_by_tokens must use text char count, not list length,
+        for multimodal content. Regression guard for #16087.
+
+        Setup: 6 messages, budget=80 (soft_ceiling=120).  The multimodal message
+        at index 1 has 500 chars of text → 135 tokens (correct) or 10 tokens (bug).
+
+        Fixed path: walk stops at the multimodal (44+135=179 > 120), cut stays at 2,
+        tail = messages[2:] = 4 messages.
+
+        Bug path: walk counts only 10 tokens for the multimodal, exhausts to head_end,
+        the head_end safeguard forces cut = n - min_tail = 3, tail = only 3 messages.
+        """
+        c = budget_compressor
+        # 500 chars → 500//4 + 10 = 135 tokens; len([text, image]) // 4 + 10 = 10 (bug)
+        big_text = "x" * 500
+        multimodal_content = [
+            {"type": "text", "text": big_text},
+            {"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}},
+        ]
+        messages = [
+            {"role": "user", "content": "head1"},               # 0
+            {"role": "user", "content": multimodal_content},    # 1: BIG (index under test)
+            {"role": "assistant", "content": "tail1"},           # 2
+            {"role": "user", "content": "tail2"},                # 3
+            {"role": "assistant", "content": "tail3"},           # 4
+            {"role": "user", "content": "tail4"},                # 5
+        ]
+        c.tail_token_budget = 80  # soft_ceiling = 120
+        head_end = 0
+        cut = c._find_tail_cut_by_tokens(messages, head_end)
+        # With the fix: cut=2, tail has 4 messages (soft_ceiling not exceeded by tail1-4).
+        # With the bug: head_end safeguard fires → cut = n - min_tail = 3, only 3 in tail.
+        assert len(messages) - cut >= 4, (
+            f"Expected ≥4 messages in tail (got {len(messages) - cut}, cut={cut}). "
+            "The multimodal message was underestimated — len(list) used instead of text chars."
+        )
+
+    def test_plain_string_content_unchanged(self, budget_compressor):
+        """Plain string content must still be estimated correctly after the fix."""
+        c = budget_compressor
+        # Same layout as the multimodal test but with a plain 500-char string.
+        # Both buggy and fixed code count plain strings the same way (len(str)).
+        # With 135 tokens the plain string also exceeds soft_ceiling=120, so
+        # the walk stops at index 1 and tail has 4 messages — same as the fix path.
+        big_plain = "x" * 500
+        messages = [
+            {"role": "user", "content": "head1"},
+            {"role": "user", "content": big_plain},   # 1: 135 tokens, plain string
+            {"role": "assistant", "content": "tail1"},
+            {"role": "user", "content": "tail2"},
+            {"role": "assistant", "content": "tail3"},
+            {"role": "user", "content": "tail4"},
+        ]
+        c.tail_token_budget = 80
+        head_end = 0
+        cut = c._find_tail_cut_by_tokens(messages, head_end)
+        assert len(messages) - cut >= 4, (
+            f"Plain string regression: expected ≥4 messages in tail, got {len(messages) - cut}"
+        )
+
+    def test_image_only_block_contributes_zero_text_chars(self, budget_compressor):
+        """Image-only content blocks (no 'text' key) contribute 0 chars + base overhead."""
+        c = budget_compressor
+        c.tail_token_budget = 500
+        image_only = [{"type": "image_url", "image_url": {"url": "https://example.com/x.jpg"}}]
+        messages = [
+            {"role": "user", "content": "a" * 4000},
+            {"role": "user", "content": image_only},   # 0 text chars → 10 tokens overhead
+            {"role": "assistant", "content": "ok"},
+        ]
+        head_end = 0
+        cut = c._find_tail_cut_by_tokens(messages, head_end)
+        assert isinstance(cut, int)
+        assert 0 <= cut <= len(messages)
+
+    def test_mixed_list_with_bare_strings_does_not_crash(self, budget_compressor):
+        """Content list may contain bare strings (not dicts) — must not raise AttributeError."""
+        c = budget_compressor
+        c.tail_token_budget = 500
+        # Bare string item alongside a dict item — normalisation elsewhere allows this.
+        mixed_content = ["Hello, world!", {"type": "text", "text": "extra text"}]
+        messages = [
+            {"role": "user", "content": mixed_content},
+            {"role": "assistant", "content": "ok"},
+        ]
+        head_end = 0
+        cut = c._find_tail_cut_by_tokens(messages, head_end)
+        assert isinstance(cut, int)
+        assert 0 <= cut <= len(messages)
 
 
 class TestUpdateModelBudgets:
