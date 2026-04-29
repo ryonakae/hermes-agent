@@ -4249,7 +4249,7 @@ def _(rid, params: dict) -> dict:
         items = [
             {
                 "text": c.text,
-                "display": c.display or c.text,
+                "display": to_plain_text(c.display) if c.display else c.text,
                 "meta": to_plain_text(c.display_meta) if c.display_meta else "",
             }
             for c in completer.get_completions(doc, None)
