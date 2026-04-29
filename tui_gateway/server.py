@@ -4055,9 +4055,18 @@ def _(rid, params: dict) -> dict:
         # name with no path separator — `@appChrome` surfaces every file
         # whose basename matches, regardless of directory depth. Matches what
         # editors like Cursor / VS Code do for Cmd-P. Path-ish queries (with
-        # `/`, `./`, `~/`, `/abs`) fall through to the directory-listing
-        # path so explicit navigation intent is preserved.
-        if is_context and path_part and "/" not in path_part and prefix_tag != "folder":
+        # `/`, `\`, or `C:\...`) fall through to the directory-listing path
+        # so explicit navigation intent is preserved.
+        has_path_navigation = (
+            "/" in path_part
+            or "\\" in path_part
+            or (
+                len(path_part) >= 2
+                and path_part[0].isalpha()
+                and path_part[1] == ":"
+            )
+        )
+        if is_context and path_part and not has_path_navigation and prefix_tag != "folder":
             root = os.getcwd()
             ranked: list[tuple[tuple[int, int], str, str]] = []
             for rel in _list_repo_files(root):
@@ -4108,7 +4117,7 @@ def _(rid, params: dict) -> dict:
             # which used to defeat the prefix and let `@folder:` list files.
             if prefix_tag and want_dir != is_dir:
                 continue
-            rel = os.path.relpath(full)
+            rel = os.path.relpath(full).replace(os.sep, "/")
             suffix = "/" if is_dir else ""
 
             if is_context and prefix_tag:
@@ -4117,7 +4126,7 @@ def _(rid, params: dict) -> dict:
                 kind = "folder" if is_dir else "file"
                 text = f"@{kind}:{rel}{suffix}"
             elif word.startswith("~"):
-                text = "~/" + os.path.relpath(full, os.path.expanduser("~")) + suffix
+                text = "~/" + os.path.relpath(full, os.path.expanduser("~")).replace(os.sep, "/") + suffix
             elif word.startswith("./"):
                 text = "./" + rel + suffix
             else:

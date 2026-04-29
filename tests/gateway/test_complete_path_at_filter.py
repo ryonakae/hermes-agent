@@ -201,6 +201,18 @@ def test_fuzzy_skipped_when_path_has_slash(tmp_path, monkeypatch):
     assert not any("useCompletion.ts" in t for t in texts), texts
 
 
+def test_fuzzy_skipped_when_path_has_backslashes(tmp_path, monkeypatch):
+    """Windows-style `\\` also means navigation, not repo-wide fuzzy search."""
+    monkeypatch.chdir(tmp_path)
+    _nested_fixture(tmp_path)
+
+    texts = [t for t, _, _ in _items(r"@file:ui-tui\src\components\app")]
+
+    assert "@file:ui-tui/src/components/appChrome.tsx" in texts, texts
+    assert "@file:ui-tui/src/components/appLayout.tsx" in texts, texts
+    assert not any("useCompletion.ts" in t for t in texts), texts
+
+
 def test_fuzzy_skipped_when_folder_tag(tmp_path, monkeypatch):
     """`@folder:<name>` still lists directories — fuzzy scanner only walks
     files (git-tracked + untracked), so defer to the dir-listing path."""
