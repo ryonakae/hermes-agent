@@ -602,6 +602,7 @@ def _normalize_completion_path(path_part: str) -> str:
             and normalized[0].isalpha()
         ):
             return f"/mnt/{normalized[0].lower()}/{normalized[3:]}"
+        return normalized
     return expanded
 
 

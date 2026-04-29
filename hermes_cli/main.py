@@ -1263,34 +1263,35 @@ def _launch_tui(
     if resume_session_id:
         env["HERMES_TUI_RESUME"] = resume_session_id
 
-    argv, cwd = _make_tui_argv(tui_dir, tui_dev)
+    try:
+        argv, cwd = _make_tui_argv(tui_dir, tui_dev)
 
-    if _is_wsl_unc_path(cwd):
-        linux_cwd = _unc_to_linux_path(cwd)
-        linux_argv0 = _unc_to_linux_path(Path(argv[1])) if len(argv) > 1 else ""
-        node_bin = argv[0]
-        node_cmd = f"{shlex.quote(node_bin)} {shlex.quote(linux_argv0)}"
-        wsl_env_pairs = []
-        for key in (
-            "HERMES_PYTHON_SRC_ROOT", "HERMES_CWD",
-            "NODE_OPTIONS", "HERMES_TUI_RESUME", "HERMES_HOME",
-            "HERMES_HEAPDUMP_ON_START",
-        ):
-            val = env.get(key)
-            if val is not None:
-                wsl_env_pairs.append(f"{shlex.quote(key)}={shlex.quote(_windows_path_to_wsl(val))}")
-        env_prefix = " ".join(wsl_env_pairs)
-        inner_cmd = f"cd {shlex.quote(linux_cwd)} && {env_prefix} {node_cmd}" if env_prefix else f"cd {shlex.quote(linux_cwd)} && {node_cmd}"
-        wsl_argv = ["wsl", "-e", "bash", "-c", inner_cmd]
-        try:
-            code = subprocess.call(wsl_argv)
-        except KeyboardInterrupt:
-            code = 130
-    else:
-        try:
-            code = subprocess.call(argv, cwd=str(cwd), env=env)
-        except KeyboardInterrupt:
-            code = 130
+        if _is_wsl_unc_path(cwd):
+            linux_cwd = _unc_to_linux_path(cwd)
+            linux_argv0 = _unc_to_linux_path(Path(argv[1])) if len(argv) > 1 else ""
+            node_bin = argv[0]
+            node_cmd = f"{shlex.quote(node_bin)} {shlex.quote(linux_argv0)}"
+            wsl_env_pairs = []
+            for key in (
+                "HERMES_PYTHON_SRC_ROOT", "HERMES_CWD",
+                "NODE_OPTIONS", "HERMES_TUI_RESUME", "HERMES_HOME",
+                "HERMES_HEAPDUMP_ON_START",
+            ):
+                val = env.get(key)
+                if val is not None:
+                    wsl_env_pairs.append(f"{shlex.quote(key)}={shlex.quote(_windows_path_to_wsl(val))}")
+            env_prefix = " ".join(wsl_env_pairs)
+            inner_cmd = f"cd {shlex.quote(linux_cwd)} && {env_prefix} {node_cmd}" if env_prefix else f"cd {shlex.quote(linux_cwd)} && {node_cmd}"
+            wsl_argv = ["wsl", "-e", "bash", "-c", inner_cmd]
+            try:
+                code = subprocess.call(wsl_argv)
+            except KeyboardInterrupt:
+                code = 130
+        else:
+            try:
+                code = subprocess.call(argv, cwd=str(cwd), env=env)
+            except KeyboardInterrupt:
+                code = 130
 
         if code in (0, 130):
             _print_tui_exit_summary(resume_session_id, active_session_file)
