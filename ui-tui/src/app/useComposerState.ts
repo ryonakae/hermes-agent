@@ -99,6 +99,7 @@ export function looksLikeDroppedPath(text: string): boolean {
 }
 
 export function useComposerState({
+  catalog,
   gw,
   onClipboardPaste,
   onImageAttached,
@@ -124,7 +125,7 @@ export function useComposerState({
   } = useQueue()
 
   const { historyRef, historyIdx, setHistoryIdx, historyDraftRef, pushHistory } = useInputHistory()
-  const { completions, compIdx, setCompIdx, compReplace } = useCompletion(input, isBlocked, gw)
+  const { completions, compIdx, setCompIdx, compReplace } = useCompletion(input, isBlocked, gw, catalog)
 
   const clearIn = useCallback(() => {
     setInput('')
