@@ -189,6 +189,21 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestJobCRUD:
+    def test_save_jobs_preserves_unicode_text(self, tmp_cron_dir):
+        save_jobs([
+            {
+                "id": "unicode-test",
+                "prompt": "分け 日本語 🐶",
+                "name": "朝の確認",
+            }
+        ])
+
+        raw = (tmp_cron_dir / "cron" / "jobs.json").read_text(encoding="utf-8")
+        assert "分け 日本語 🐶" in raw
+        assert "朝の確認" in raw
+        assert "\\u5206" not in raw
+        assert json.loads(raw)["jobs"][0]["prompt"] == "分け 日本語 🐶"
+
     def test_create_and_get(self, tmp_cron_dir):
         job = create_job(prompt="Check server status", schedule="30m")
         assert job["id"]
