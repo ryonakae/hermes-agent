@@ -8535,6 +8535,7 @@ class AIAgent:
         Handles reasoning extraction, reasoning_details, and optional tool_calls
         so both the tool-call path and the final-response path share one builder.
         """
+        assistant_tool_calls = getattr(assistant_message, "tool_calls", None)
         reasoning_text = self._extract_reasoning(assistant_message)
         _from_structured = bool(reasoning_text)
 
@@ -8594,16 +8595,22 @@ class AIAgent:
             "finish_reason": finish_reason,
         }
 
-        if hasattr(assistant_message, "reasoning_content"):
-            raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
-            if raw_reasoning_content is not None:
-                msg["reasoning_content"] = _sanitize_surrogates(raw_reasoning_content)
-            elif msg.get("tool_calls") and self._needs_deepseek_tool_reasoning():
-                # DeepSeek thinking mode requires reasoning_content on every
-                # assistant tool-call message. Without it, replaying the
-                # persisted message causes HTTP 400. Include empty string
-                # as a defensive compatibility fallback (refs #15250).
-                msg["reasoning_content"] = ""
+        raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
+        if raw_reasoning_content is None and hasattr(assistant_message, "model_extra"):
+            model_extra = getattr(assistant_message, "model_extra", None) or {}
+            if isinstance(model_extra, dict) and "reasoning_content" in model_extra:
+                raw_reasoning_content = model_extra["reasoning_content"]
+        if raw_reasoning_content is not None:
+            msg["reasoning_content"] = _sanitize_surrogates(raw_reasoning_content)
+        elif assistant_tool_calls and self._needs_thinking_reasoning_pad():
+            # DeepSeek v4 thinking mode and Kimi / Moonshot thinking mode
+            # both require reasoning_content on every assistant tool-call
+            # message. Without it, replaying the persisted message causes
+            # HTTP 400 ("The reasoning_content in the thinking mode must
+            # be passed back to the API"). Include streamed reasoning
+            # text when captured; otherwise pad with empty string.
+            # Refs #15250, #17400.
+            msg["reasoning_content"] = reasoning_text or ""
 
         # Additive fallback (refs #16844, #16884). Streaming-only providers
         # (glm, MiniMax, gpt-5.x via aigw, Anthropic via openai-compat shims)
@@ -8660,9 +8667,9 @@ class AIAgent:
         if codex_message_items:
             msg["codex_message_items"] = codex_message_items
 
-        if assistant_message.tool_calls:
+        if assistant_tool_calls:
             tool_calls = []
-            for tool_call in assistant_message.tool_calls:
+            for tool_call in assistant_tool_calls:
                 raw_id = getattr(tool_call, "id", None)
                 call_id = getattr(tool_call, "call_id", None)
                 if not isinstance(call_id, str) or not call_id.strip():
@@ -8711,6 +8718,18 @@ class AIAgent:
 
         return msg
 
+    def _needs_thinking_reasoning_pad(self) -> bool:
+        """Return True when the active provider enforces reasoning_content echo-back.
+
+        DeepSeek v4 thinking and Kimi / Moonshot thinking both reject replays
+        of assistant tool-call messages that omit ``reasoning_content`` (refs
+        #15250, #17400).
+        """
+        return (
+            self._needs_deepseek_tool_reasoning()
+            or self._needs_kimi_tool_reasoning()
+        )
+
     def _needs_kimi_tool_reasoning(self) -> bool:
         """Return True when the current provider is Kimi / Moonshot thinking mode.
 
@@ -8753,20 +8772,17 @@ class AIAgent:
             api_msg["reasoning_content"] = existing
             return
 
-        needs_thinking_pad = (
-            self._needs_kimi_tool_reasoning()
-            or self._needs_deepseek_tool_reasoning()
-        )
+        needs_thinking_pad = self._needs_thinking_reasoning_pad()
 
         # 2. Cross-provider poisoned history (#15748): on DeepSeek/Kimi,
         # if the source turn has tool_calls AND a 'reasoning' field but no
         # 'reasoning_content' key, the 'reasoning' text was written by a
         # prior provider (e.g. MiniMax) — DeepSeek's own _build_assistant_message
-        # always pins reasoning_content="" at creation time for tool-call turns,
-        # so the shape (reasoning set, reasoning_content absent, tool_calls
-        # present) is unreachable from same-provider DeepSeek history. Inject
-        # "" to satisfy the API without leaking another provider's chain of
-        # thought to DeepSeek/Kimi.
+        # pins reasoning_content at creation time for tool-call turns, so the
+        # shape (reasoning set, reasoning_content absent, tool_calls present)
+        # is unreachable from same-provider DeepSeek history after this fix.
+        # Inject "" to satisfy the API without leaking another provider's
+        # chain of thought to DeepSeek/Kimi.
         normalized_reasoning = source_msg.get("reasoning")
         if (
             needs_thinking_pad
@@ -8779,9 +8795,9 @@ class AIAgent:
 
         # 3. Healthy session: promote 'reasoning' field to 'reasoning_content'
         # for providers that use the internal 'reasoning' key.
-        # This must happen BEFORE the DeepSeek/Kimi tool-call check so that
-        # genuine reasoning content is not overwritten by the empty-string
-        # fallback (#15812 regression in PR #15478).
+        # This must happen before the unconditional empty-string fallback so
+        # genuine reasoning content is not overwritten (#15812 regression in
+        # PR #15478).
         if isinstance(normalized_reasoning, str) and normalized_reasoning:
             api_msg["reasoning_content"] = normalized_reasoning
             return
