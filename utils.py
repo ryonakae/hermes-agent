@@ -14,6 +14,18 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
+class _ReadableYamlDumper(yaml.SafeDumper):
+    """YAML dumper tuned for human-edited Hermes config files."""
+
+
+def _represent_readable_string(dumper: yaml.Dumper, data: str):
+    style = "|" if "\n" in data else None
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+
+_ReadableYamlDumper.add_representer(str, _represent_readable_string)
+
+
 TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
 
 
@@ -170,7 +182,14 @@ def atomic_yaml_write(
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, default_flow_style=default_flow_style, sort_keys=sort_keys, allow_unicode=True)
+            yaml.dump(
+                data,
+                f,
+                Dumper=_ReadableYamlDumper,
+                default_flow_style=default_flow_style,
+                sort_keys=sort_keys,
+                allow_unicode=True,
+            )
             if extra_content:
                 f.write(extra_content)
             f.flush()
