@@ -376,8 +376,8 @@ class TestSuspendRecentlyActiveSkipsResumePending:
         assert e.suspended is False
         assert e.resume_pending is True
 
-    def test_non_resume_pending_still_suspended(self, tmp_path):
-        """Non-resume sessions still get the old crash-recovery suspension."""
+    def test_non_resume_pending_gets_resume_pending(self, tmp_path):
+        """Non-resume sessions are now marked resume_pending (not suspended)."""
         store = _make_store(tmp_path)
         source_a = _make_source(chat_id="a")
         source_b = _make_source(chat_id="b")
@@ -386,9 +386,11 @@ class TestSuspendRecentlyActiveSkipsResumePending:
         store.mark_resume_pending(entry_a.session_key)
 
         count = store.suspend_recently_active()
+        # entry_a is already resume_pending → skipped. entry_b gets marked.
         assert count == 1
         assert store._entries[entry_a.session_key].suspended is False
-        assert store._entries[entry_b.session_key].suspended is True
+        assert store._entries[entry_b.session_key].resume_pending is True
+        assert store._entries[entry_b.session_key].suspended is False
 
 
 # ---------------------------------------------------------------------------
@@ -999,3 +1001,65 @@ class TestStuckLoopEscalation:
 
         assert store._entries[entry.session_key].resume_pending is False
         assert not counts_file.exists()
+
+    def test_increment_restart_failure_counts_uses_atomic_json_write(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway.run import GatewayRunner
+
+        source = _make_source()
+        session_key = _make_store(tmp_path).get_or_create_session(source).session_key
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        calls = []
+
+        def _fake_atomic_json_write(path, payload, **kwargs):
+            calls.append((path, payload, kwargs))
+
+        monkeypatch.setattr("gateway.run.atomic_json_write", _fake_atomic_json_write)
+
+        runner = object.__new__(GatewayRunner)
+        runner._increment_restart_failure_counts({session_key})
+
+        assert calls == [
+            (
+                tmp_path / ".restart_failure_counts",
+                {session_key: 1},
+                {"indent": None},
+            )
+        ]
+
+    def test_clear_restart_failure_count_uses_atomic_json_write_when_entries_remain(
+        self, tmp_path, monkeypatch
+    ):
+        import json
+
+        from gateway.run import GatewayRunner
+
+        source = _make_source()
+        session_key = _make_store(tmp_path).get_or_create_session(source).session_key
+        other_key = "agent:main:telegram:dm:other"
+        counts_file = tmp_path / ".restart_failure_counts"
+        counts_file.write_text(
+            json.dumps({session_key: 2, other_key: 1}),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        calls = []
+
+        def _fake_atomic_json_write(path, payload, **kwargs):
+            calls.append((path, payload, kwargs))
+
+        monkeypatch.setattr("gateway.run.atomic_json_write", _fake_atomic_json_write)
+
+        runner = object.__new__(GatewayRunner)
+        runner._clear_restart_failure_count(session_key)
+
+        assert calls == [
+            (
+                tmp_path / ".restart_failure_counts",
+                {other_key: 1},
+                {"indent": None},
+            )
+        ]
