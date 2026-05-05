@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 
 import type { CompletionItem } from '../app/interfaces.js'
+import { looksLikeSlashCommand } from '../domain/slash.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import type { CompletionResponse } from '../gatewayTypes.js'
 import { asRpcResult } from '../lib/rpc.js'
 import type { SlashCatalog } from '../types.js'
 
-const TAB_PATH_RE = /((?:["']?(?:[A-Za-z]:[\\/]|\.{1,2}\/|~\/|\/|@|[^"'`\s]+\/))[^\s]*)$/
-const DYNAMIC_SLASH_COMMANDS = new Set(['/model', '/personality', '/skin'])
+const TAB_PATH_RE = /((?:["']?(?:[A-Za-z]:[\/]|\.{1,2}\/|~\/|\/|@|[^"'`\s]+\/))[^\s]*)$/
+const DYNAMIC_SLASH_COMMANDS = new Set(['/model', '/personality', '/provider', '/skin'])
 
 const completionText = (cmdName: string, word: string) => (cmdName === word ? `${cmdName} ` : cmdName)
 
@@ -108,6 +109,34 @@ export function getLocalSlashCompletion(text: string, catalog: null | SlashCatal
   return items.length ? { items, replace_from: 1 } : null
 }
 
+export function completionRequestForInput(
+  input: string
+):
+  | { method: 'complete.path'; params: { word: string }; replaceFrom: number }
+  | { method: 'complete.slash'; params: { text: string }; replaceFrom: number }
+  | null {
+  const isSlashCommand = looksLikeSlashCommand(input)
+  const pathWord = isSlashCommand ? null : (input.match(TAB_PATH_RE)?.[1] ?? null)
+
+  if (!isSlashCommand && !pathWord) {
+    return null
+  }
+
+  if (isSlashCommand && /^\/(?:model|provider)(?:\s|$)/.test(input)) {
+    return null
+  }
+
+  if (isSlashCommand) {
+    return { method: 'complete.slash', params: { text: input }, replaceFrom: 1 }
+  }
+
+  return {
+    method: 'complete.path',
+    params: { word: pathWord! },
+    replaceFrom: input.length - pathWord!.length
+  }
+}
+
 export function useCompletion(input: string, blocked: boolean, gw: GatewayClient, catalog: null | SlashCatalog) {
   const [completions, setCompletions] = useState<CompletionItem[]>([])
   const [compIdx, setCompIdx] = useState(0)
@@ -134,45 +163,28 @@ export function useCompletion(input: string, blocked: boolean, gw: GatewayClient
 
     ref.current = input
 
-    const isSlash = input.startsWith('/')
-    const pathWord = isSlash ? null : (input.match(TAB_PATH_RE)?.[1] ?? null)
-
-    if (!isSlash && !pathWord) {
-      clear()
-
-      return
-    }
-
-    // `/model` / `/provider` use the two-step ModelPicker (real curated IDs).
-    // Slash completion here only showed short aliases + vendor/family meta.
-    if (isSlash && /^\/(?:model|provider)(?:\s|$)/.test(input)) {
-      clear()
+    const localSlash = getLocalSlashCompletion(input, catalog)
+    if (localSlash) {
+      setCompletions(localSlash.items ?? [])
+      setCompIdx(0)
+      setCompReplace(localSlash.replace_from ?? 1)
 
       return
     }
 
-    const pathReplace = input.length - (pathWord?.length ?? 0)
+    const request = completionRequestForInput(input)
+    if (!request) {
+      clear()
+
+      return
+    }
 
     const t = setTimeout(() => {
       if (ref.current !== input) {
         return
       }
 
-      const localSlash = isSlash ? getLocalSlashCompletion(input, catalog) : null
-
-      if (localSlash) {
-        setCompletions(localSlash.items ?? [])
-        setCompIdx(0)
-        setCompReplace(localSlash.replace_from ?? 1)
-
-        return
-      }
-
-      const req = isSlash
-        ? gw.request<CompletionResponse>('complete.slash', { text: input })
-        : gw.request<CompletionResponse>('complete.path', { word: pathWord })
-
-      req
+      gw.request<CompletionResponse>(request.method, request.params)
         .then(raw => {
           if (ref.current !== input) {
             return
@@ -182,7 +194,7 @@ export function useCompletion(input: string, blocked: boolean, gw: GatewayClient
 
           setCompletions(r?.items ?? [])
           setCompIdx(0)
-          setCompReplace(isSlash ? (r?.replace_from ?? 1) : pathReplace)
+          setCompReplace(request.method === 'complete.slash' ? (r?.replace_from ?? 1) : request.replaceFrom)
         })
         .catch((e: unknown) => {
           if (ref.current !== input) {
@@ -197,7 +209,7 @@ export function useCompletion(input: string, blocked: boolean, gw: GatewayClient
             }
           ])
           setCompIdx(0)
-          setCompReplace(isSlash ? 1 : pathReplace)
+          setCompReplace(request.replaceFrom)
         })
     }, 60)
 
