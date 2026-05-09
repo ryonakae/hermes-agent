@@ -133,6 +133,32 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_metadata_round_trips_through_show(worker_env):
+    """Structured completion metadata should be visible to downstream agents."""
+    from tools import kanban_tools as kt
+
+    handoff = {
+        "changed_files": ["hermes_cli/kanban.py"],
+        "verification": ["pytest tests/tools/test_kanban_tools.py -q"],
+        "dependencies": [],
+        "blocked_reason": None,
+        "retry_notes": "none",
+        "residual_risk": ["dashboard rendering not exercised"],
+    }
+
+    complete_out = kt._handle_complete({
+        "summary": "finished with structured evidence",
+        "metadata": handoff,
+    })
+    assert json.loads(complete_out)["ok"] is True
+
+    show_out = kt._handle_show({"task_id": worker_env})
+    shown = json.loads(show_out)
+    assert shown["task"]["status"] == "done"
+    assert shown["runs"][-1]["summary"] == "finished with structured evidence"
+    assert shown["runs"][-1]["metadata"] == handoff
+
+
 def test_complete_with_result_only(worker_env):
     """`result` alone (without summary) is accepted for legacy compat."""
     from tools import kanban_tools as kt
@@ -188,6 +214,61 @@ def test_heartbeat_without_note(worker_env):
     assert d["ok"] is True
 
 
+def test_heartbeat_extends_claim_expires(worker_env):
+    """The kanban_heartbeat tool MUST extend claim_expires, not just
+    update last_heartbeat_at — otherwise long-running workers loop the
+    heartbeat tool diligently and still get reclaimed by
+    release_stale_claims at DEFAULT_CLAIM_TTL_SECONDS.
+
+    Regression test for the bug where _handle_heartbeat called
+    heartbeat_worker but never heartbeat_claim, so claim_expires sat
+    static while last_heartbeat_at advanced.
+    """
+    import time as _time
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # Rewind claim_expires into the past so any forward movement is
+    # unambiguous (avoids time.sleep flakiness).
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (1, worker_env),
+        )
+        conn.commit()
+        before = conn.execute(
+            "SELECT claim_expires FROM tasks WHERE id = ?", (worker_env,)
+        ).fetchone()["claim_expires"]
+    finally:
+        conn.close()
+    assert before == 1
+
+    out = kt._handle_heartbeat({"note": "still alive"})
+    assert json.loads(out).get("ok") is True
+
+    conn = kb.connect()
+    try:
+        after = conn.execute(
+            "SELECT claim_expires FROM tasks WHERE id = ?", (worker_env,)
+        ).fetchone()["claim_expires"]
+    finally:
+        conn.close()
+
+    now = int(_time.time())
+    # claim_expires should be roughly now + DEFAULT_CLAIM_TTL_SECONDS.
+    # We assert a generous floor (now + half the default TTL) to keep the
+    # test stable against future TTL changes.
+    assert after > before, (
+        f"claim_expires did not advance ({before} -> {after}); workers "
+        f"would be reclaimed at TTL despite heartbeating"
+    )
+    assert after >= now + (kb.DEFAULT_CLAIM_TTL_SECONDS // 2), (
+        f"claim_expires={after} is suspiciously close to now={now}; "
+        f"expected at least now + {kb.DEFAULT_CLAIM_TTL_SECONDS // 2}"
+    )
+
+
 def test_comment_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_comment({
@@ -215,19 +296,38 @@ def test_comment_rejects_empty_body(worker_env):
     assert json.loads(out).get("error")
 
 
-def test_comment_custom_author(worker_env):
+def test_comment_ignores_caller_supplied_author(worker_env):
+    """``args["author"]`` is no longer honored — the author is always
+    derived from ``HERMES_PROFILE`` so a worker can't forge a comment
+    under an authoritative-looking name like ``hermes-system`` and
+    poison the next worker's prompt context. Cross-task commenting
+    itself remains unrestricted (see #19713); only the author override
+    is removed.
+    """
     from tools import kanban_tools as kt
     out = kt._handle_comment({
-        "task_id": worker_env, "body": "hi", "author": "custom-bot",
+        "task_id": worker_env, "body": "hi", "author": "hermes-system",
     })
     assert json.loads(out)["ok"]
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
         comments = kb.list_comments(conn, worker_env)
-        assert comments[0].author == "custom-bot"
+        # Author comes from HERMES_PROFILE in the fixture, not the
+        # caller-supplied "hermes-system" override.
+        assert comments[0].author == "test-worker"
     finally:
         conn.close()
+
+
+def test_comment_schema_omits_author_override():
+    """The ``author`` property must not appear on KANBAN_COMMENT_SCHEMA;
+    exposing it to the LLM would re-introduce the forgery surface this
+    handler is hardened against.
+    """
+    from tools.kanban_tools import KANBAN_COMMENT_SCHEMA
+    props = KANBAN_COMMENT_SCHEMA["parameters"]["properties"]
+    assert "author" not in props
 
 
 def test_create_happy_path(worker_env):
@@ -576,6 +676,42 @@ def test_worker_heartbeat_rejects_foreign_task_id(worker_env):
     assert "refusing to mutate" in d.get("error", "")
 
 
+def test_worker_can_comment_on_foreign_task(worker_env):
+    """Cross-task commenting must remain unrestricted (#19713 policy).
+
+    The author-forgery hardening removed args['author'] but deliberately
+    did NOT add an ownership gate to kanban_comment — comments are the
+    documented handoff channel between tasks. This test pins that policy
+    so a future change accidentally adding ``_enforce_worker_task_ownership``
+    to ``_handle_comment`` would fail CI immediately.
+    """
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="sibling")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_comment({
+        "task_id": other,
+        "body": "handoff: see prior findings before starting",
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, f"cross-task comment must succeed: {d}"
+
+    # The comment lands on the foreign task, attributed to the worker's
+    # HERMES_PROFILE — never to a caller-controlled string.
+    conn = kb.connect()
+    try:
+        comments = kb.list_comments(conn, other)
+        assert len(comments) == 1
+        assert comments[0].author == "test-worker"
+        assert comments[0].body.startswith("handoff:")
+    finally:
+        conn.close()
+
+
 def test_worker_complete_own_task_still_works(worker_env):
     """The ownership check doesn't break the normal own-task happy path."""
     from tools import kanban_tools as kt
@@ -583,6 +719,44 @@ def test_worker_complete_own_task_still_works(worker_env):
     out = kt._handle_complete({"task_id": worker_env, "summary": "explicit own"})
     d = json.loads(out)
     assert d.get("ok") is True and d.get("task_id") == worker_env
+
+
+def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
+    """A retried worker cannot complete the task using an old run token."""
+    from hermes_cli import kanban_db as kb
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        run1 = kb.latest_run(conn, worker_env)
+        kb._set_worker_pid(conn, worker_env, 98765)
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
+        assert kb.detect_crashed_workers(conn) == [worker_env]
+
+        kb.claim_task(conn, worker_env)
+        run2 = kb.latest_run(conn, worker_env)
+        assert run2.id != run1.id
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run1.id))
+    out = kt._handle_complete({"summary": "late stale completion"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "running"
+        assert task.current_run_id == run2.id
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run2.id))
+    out = kt._handle_complete({"summary": "current completion"})
+    d = json.loads(out)
+    assert d.get("ok") is True
 
 
 def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):

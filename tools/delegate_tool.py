@@ -462,6 +462,37 @@ def _is_mcp_toolset_name(name: str) -> bool:
     return bool(target and str(target).startswith("mcp-"))
 
 
+def _expand_parent_toolsets(parent_toolsets: set) -> set:
+    """Expand composite toolsets so individual toolset names are recognized.
+
+    When a parent uses a composite toolset like ``hermes-cli`` (which bundles
+    all core tools), the child may request individual toolsets such as ``web``
+    or ``terminal``.  A simple name-based intersection would reject them
+    because ``"web" != "hermes-cli"``.
+
+    This helper collects the tool names from each parent toolset, then adds
+    the names of any individual toolsets whose tools are a *subset* of the
+    parent's available tools.  The original parent toolset names are preserved.
+    """
+    parent_tool_names: set = set()
+    for ts_name in parent_toolsets:
+        ts_def = TOOLSETS.get(ts_name)
+        if ts_def:
+            parent_tool_names.update(ts_def.get("tools", []))
+
+    if not parent_tool_names:
+        return set(parent_toolsets)
+
+    expanded = set(parent_toolsets)
+    for ts_name, ts_def in TOOLSETS.items():
+        if ts_name in expanded:
+            continue
+        ts_tools = ts_def.get("tools", [])
+        if ts_tools and set(ts_tools).issubset(parent_tool_names):
+            expanded.add(ts_name)
+    return expanded
+
+
 def _preserve_parent_mcp_toolsets(
     child_toolsets: List[str], parent_toolsets: set[str]
 ) -> List[str]:
@@ -907,8 +938,11 @@ def _build_child_agent(
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
     if toolsets:
-        # Intersect with parent — subagent must not gain tools the parent lacks
-        child_toolsets = [t for t in toolsets if t in parent_toolsets]
+        # Intersect with parent — subagent must not gain tools the parent lacks.
+        # Expand composite toolsets (e.g. hermes-cli) so that individual
+        # toolset names (e.g. web, terminal) are recognised during intersection.
+        expanded_parent = _expand_parent_toolsets(parent_toolsets)
+        child_toolsets = [t for t in toolsets if t in expanded_parent]
         if _get_inherit_mcp_toolsets():
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
@@ -1833,6 +1867,29 @@ def _run_single_child(
             logger.debug("Failed to close child agent after delegation")
 
 
+def _recover_tasks_from_json_string(
+    tasks: Any,
+) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    if not isinstance(tasks, str):
+        return None, None
+    raw = tasks.strip()
+    if not raw:
+        return None, "Provide either 'goal' (single task) or 'tasks' (batch)."
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return None, (
+            "tasks must be a JSON array of task objects; received a string "
+            f"that could not be parsed as JSON ({exc.msg})."
+        )
+    if not isinstance(parsed, list):
+        return None, (
+            f"tasks must be a JSON array of task objects; parsed "
+            f"{type(parsed).__name__} instead."
+        )
+    return parsed, None
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -1917,6 +1974,12 @@ def delegate_task(
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
+    recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
+    if tasks_error:
+        return tool_error(tasks_error)
+    if recovered_tasks is not None:
+        tasks = recovered_tasks
+
     if tasks and isinstance(tasks, list):
         if len(tasks) > max_children:
             return tool_error(
@@ -1939,6 +2002,10 @@ def delegate_task(
 
     # Validate each task has a goal
     for i, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            return tool_error(
+                f"Task {i} must be an object, got {type(task).__name__}."
+            )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
@@ -2479,7 +2546,7 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "acp_command": {
                             "type": "string",
-                            "description": "Per-task ACP command override (e.g. 'claude'). Overrides the top-level acp_command for this task only.",
+                            "description": "Per-task ACP command override (e.g. 'copilot'). Overrides the top-level acp_command for this task only.",
                         },
                         "acp_args": {
                             "type": "array",
@@ -2519,10 +2586,11 @@ DELEGATE_TASK_SCHEMA = {
             "acp_command": {
                 "type": "string",
                 "description": (
-                    "Override ACP command for child agents (e.g. 'claude', 'copilot'). "
+                    "Override ACP command for child agents (e.g. 'copilot'). "
                     "When set, children use ACP subprocess transport instead of inheriting "
-                    "the parent's transport. Enables spawning Claude Code (claude --acp --stdio) "
-                    "or other ACP-capable agents from any parent, including Discord/Telegram/CLI."
+                    "the parent's transport. Requires an ACP-compatible CLI "
+                    "(currently GitHub Copilot CLI via 'copilot --acp --stdio'). "
+                    "See agent/copilot_acp_client.py for the implementation."
                 ),
             },
             "acp_args": {
@@ -2530,7 +2598,7 @@ DELEGATE_TASK_SCHEMA = {
                 "items": {"type": "string"},
                 "description": (
                     "Arguments for the ACP command (default: ['--acp', '--stdio']). "
-                    "Only used when acp_command is set. Example: ['--acp', '--stdio', '--model', 'claude-opus-4-6']"
+                    "Only used when acp_command is set."
                 ),
             },
         },
