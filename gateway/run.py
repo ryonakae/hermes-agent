@@ -6183,6 +6183,13 @@ class GatewayRunner:
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            _return_result = _agent_result
+            _goal_agent_result = _agent_result
+            _stashed_results = getattr(self, "_post_turn_agent_results", None)
+            if isinstance(_stashed_results, dict):
+                _stashed_result = _stashed_results.pop(_quick_key, None)
+                if _goal_agent_result is None:
+                    _goal_agent_result = _stashed_result
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -6191,10 +6198,10 @@ class GatewayRunner:
             # broken judge never breaks normal message handling.
             try:
                 _final_text = ""
-                if isinstance(_agent_result, dict):
-                    _final_text = str(_agent_result.get("final_response") or "")
-                elif isinstance(_agent_result, str):
-                    _final_text = _agent_result
+                if isinstance(_goal_agent_result, dict):
+                    _final_text = str(_goal_agent_result.get("final_response") or "")
+                elif isinstance(_goal_agent_result, str):
+                    _final_text = _goal_agent_result
                 # Skip for empty responses (interrupted / errored) — the
                 # judge would almost always say "continue" and we'd loop
                 # on error. Let the user drive the next turn.
@@ -6211,7 +6218,7 @@ class GatewayRunner:
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
-            return _agent_result
+            return _return_result
         finally:
             # If _run_agent replaced the sentinel with a real agent and
             # then cleaned it up, this is a no-op.  If we exited early
@@ -7412,6 +7419,11 @@ class GatewayRunner:
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                _stashed_results = getattr(self, "_post_turn_agent_results", None)
+                if _stashed_results is None:
+                    _stashed_results = {}
+                    self._post_turn_agent_results = _stashed_results
+                _stashed_results[_quick_key] = agent_result
                 return None
 
             return response
