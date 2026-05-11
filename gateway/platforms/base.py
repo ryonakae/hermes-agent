@@ -1312,6 +1312,15 @@ class BasePlatformAdapter(ABC):
         self._typing_paused: set = set()
 
     @property
+    def message_len_fn(self) -> Callable[[str], int]:
+        """Return the length function for measuring message size on this platform.
+
+        Override in adapters whose platform counts characters differently from
+        Python ``len`` (e.g. Telegram counts UTF-16 code units).
+        """
+        return len
+
+    @property
     def has_fatal_error(self) -> bool:
         return self._fatal_error_message is not None
 
@@ -1510,6 +1519,33 @@ class BasePlatformAdapter(ABC):
     # such as DingTalk AI Cards) override this to True (class attribute or
     # property) so the stream consumer knows not to short-circuit.
     REQUIRES_EDIT_FINALIZE: bool = False
+
+    async def create_handoff_thread(
+        self,
+        parent_chat_id: str,
+        name: str,
+    ) -> Optional[str]:
+        """Create a fresh thread under ``parent_chat_id`` for a session handoff.
+
+        Used by the gateway's handoff watcher when transferring a CLI
+        session to a thread-capable platform — the new thread isolates the
+        handed-off conversation from any pre-existing chat in the home
+        channel and gives users a clean per-handoff scrollback.
+
+        Returns the new thread/topic id (as a string) on success, or
+        ``None`` if the platform doesn't support threading or the
+        attempt failed (permissions, topics-mode off, etc.). When ``None``
+        is returned the watcher falls back to using ``parent_chat_id``
+        directly.
+
+        Default implementation returns ``None`` — adapters that support
+        threads override this. See:
+          - Telegram: forum topics in groups, DM topics with bot API 9.4+
+          - Discord:  text-channel threads (1440-min auto-archive)
+          - Slack:    seed-message thread anchoring
+        """
+        return None
+
 
     async def edit_message(
         self,
