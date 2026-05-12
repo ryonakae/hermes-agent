@@ -861,6 +861,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     chat_id       TEXT NOT NULL,
     thread_id     TEXT NOT NULL DEFAULT '',
     user_id       TEXT,
+    notifier_profile TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
@@ -1084,6 +1085,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_events_run "
             "ON task_events(run_id, id)"
         )
+
+    notify_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
+    ).fetchone() is not None
+    if notify_table_exists:
+        notify_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
+        }
+        if "notifier_profile" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -1813,7 +1826,7 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def recompute_ready(conn: sqlite3.Connection) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done``.
+    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
@@ -1831,7 +1844,7 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] == "done" for p in parents):
+            if all(p["status"] in {"done", "archived"} for p in parents):
                 conn.execute(
                     "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                     (task_id,),
@@ -1872,7 +1885,7 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
         if undone:
@@ -3917,6 +3930,25 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+
+    # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
+    # (fallback_providers, toolsets, agent settings, etc.) instead of the root
+    # config.  Without this, `env = dict(os.environ)` copies only the parent's
+    # env, and when the child process starts `hermes -p <name>` the
+    # _apply_profile_override() runs *before* hermes_constants is imported.
+    # If HERMES_HOME is absent from the child's env, get_hermes_home() falls
+    # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
+    # profile-specific config entirely.  Fixes profile-scoped fallback_providers
+    # being invisible to kanban workers.
+    from hermes_cli.profiles import resolve_profile_env
+    try:
+        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        # Profile dir doesn't exist — defer resolution to the CLI's
+        # _apply_profile_override() via HERMES_PROFILE (set below).
+        # This only happens in test fixtures where the isolated
+        # HERMES_HOME never had profiles created.
+        pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -4341,6 +4373,7 @@ def add_notify_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread)."""
@@ -4349,10 +4382,10 @@ def add_notify_sub(
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, platform, chat_id, thread_id or "", user_id, now),
+            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
         )
 
 
