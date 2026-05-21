@@ -17322,7 +17322,13 @@ class GatewayRunner:
                 }
                 if _edit_accepts_metadata:
                     kwargs["metadata"] = _progress_metadata
-                return await adapter.edit_message(**kwargs)
+                try:
+                    return await adapter.edit_message(**kwargs)
+                except TypeError as exc:
+                    if "metadata" not in str(exc) or "metadata" not in kwargs:
+                        raise
+                    kwargs.pop("metadata", None)
+                    return await adapter.edit_message(**kwargs)
 
             def _progress_text(lines: list) -> str:
                 return "\n".join(str(line) for line in lines)

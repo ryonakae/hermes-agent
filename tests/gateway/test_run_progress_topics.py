@@ -114,6 +114,24 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class MetadataBlindObservedProgressAdapter(ProgressCaptureAdapter):
+    async def edit_message(self, *args, **kwargs) -> SendResult:
+        return await self._original_edit_message(*args, **kwargs)
+
+    async def _original_edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "finalize": finalize,
+            }
+        )
+        return SendResult(success=True, message_id=message_id)
+
+
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
     SUPPORTS_MESSAGE_EDITING = False
 
@@ -328,6 +346,45 @@ async def test_run_agent_progress_edits_keep_originating_topic_metadata(monkeypa
     assert result["final_response"] == "done"
     assert adapter.edits
     assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.edits)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_progress_retries_without_metadata_when_observer_hides_signature(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    setattr(fake_dotenv, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    setattr(fake_run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = MetadataBlindObservedProgressAdapter(platform=Platform.SLACK)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="group",
+        thread_id="177.1",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-progress-slack-observed-edit",
+        session_key="agent:main:slack:group:C123:177.1",
+        event_message_id="177.1",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.edits
+    assert "metadata" not in adapter.edits[0]
 
 
 @pytest.mark.asyncio

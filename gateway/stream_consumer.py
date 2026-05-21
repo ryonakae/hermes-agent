@@ -231,7 +231,13 @@ class GatewayStreamConsumer:
                     kwargs["metadata"] = self.metadata
             except (TypeError, ValueError):
                 pass
-        return await self.adapter.edit_message(**kwargs)
+        try:
+            return await self.adapter.edit_message(**kwargs)
+        except TypeError as exc:
+            if "metadata" not in str(exc) or "metadata" not in kwargs:
+                raise
+            kwargs.pop("metadata", None)
+            return await self.adapter.edit_message(**kwargs)
 
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
