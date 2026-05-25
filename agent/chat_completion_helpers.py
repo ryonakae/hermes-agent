@@ -451,7 +451,26 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
         # Stale-call detector: kill the connection if no response
         # arrives within the configured timeout.
-        if _elapsed > _stale_timeout:
+        #
+        # For codex_responses the request is internally streaming (the
+        # client iterates ``responses.stream(...)`` events under the hood
+        # of what looks like a non-streaming call to this layer). If any
+        # event has already arrived we treat the detector as an activity
+        # watchdog and measure staleness from the last event rather than
+        # from ``_call_start``. Without that, long-but-healthy turns
+        # (extended reasoning, multi-tool-call sequences) cross the
+        # wall-clock stale threshold while events are still flowing and
+        # get misreported as "No response from provider for Ns
+        # (non-streaming, ...)". The TTFB watchdog above already handles
+        # the zero-events case; this branch covers events-then-silence.
+        _last_event_ts = getattr(agent, "_codex_stream_last_event_ts", None)
+        _codex_has_events = (
+            agent.api_mode == "codex_responses" and _last_event_ts is not None
+        )
+        _stale_elapsed = (
+            time.time() - _last_event_ts if _codex_has_events else _elapsed
+        )
+        if _stale_elapsed > _stale_timeout:
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
@@ -460,24 +479,38 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     _silent_hint = _hint_fn(model=api_kwargs.get("model"))
                 except Exception:
                     _silent_hint = None
-            logger.warning(
-                "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                "model=%s context=~%s tokens. Killing connection.",
-                _elapsed, _stale_timeout,
-                api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
-            )
-            if _silent_hint:
-                agent._buffer_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"{_silent_hint}"
+            if _codex_has_events:
+                logger.warning(
+                    "Codex Responses stream stale for %.0fs since last event "
+                    "(threshold %.0fs, total elapsed %.0fs). model=%s "
+                    "context=~%s tokens. Killing connection.",
+                    _stale_elapsed, _stale_timeout, _elapsed,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                 )
-            else:
                 agent._buffer_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
+                    f"⚠️ No stream events from provider for {int(_stale_elapsed)}s "
+                    f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
                     f"Aborting call."
                 )
+            else:
+                logger.warning(
+                    "Non-streaming API call stale for %.0fs (threshold %.0fs). "
+                    "model=%s context=~%s tokens. Killing connection.",
+                    _elapsed, _stale_timeout,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                )
+                if _silent_hint:
+                    agent._buffer_status(
+                        f"⚠️ No response from provider for {int(_elapsed)}s "
+                        f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
+                        f"{_silent_hint}"
+                    )
+                else:
+                    agent._buffer_status(
+                        f"⚠️ No response from provider for {int(_elapsed)}s "
+                        f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
+                        f"Aborting call."
+                    )
             try:
                 if agent.api_mode == "anthropic_messages":
                     agent._anthropic_client.close()
@@ -492,7 +525,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
-                if _silent_hint:
+                if _codex_has_events:
+                    result["error"] = TimeoutError(
+                        f"Codex Responses stream stalled: no new event for "
+                        f"{int(_stale_elapsed)}s (threshold: {int(_stale_timeout)}s)"
+                    )
+                elif _silent_hint:
                     result["error"] = TimeoutError(
                         f"Non-streaming API call timed out after {int(_elapsed)}s "
                         f"with no response (threshold: {int(_stale_timeout)}s). "
