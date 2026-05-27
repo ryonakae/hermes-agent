@@ -895,6 +895,22 @@ def init_agent(
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
+
+    # Eager fallback on stream-stall / connection timeouts (#22277).
+    # Default off to preserve historical behavior; users with paid
+    # primaries + OAuth-backed fallbacks (e.g. Anthropic + openai-codex)
+    # opt in via `agent.eager_fallback_on_timeout: true` so a degraded
+    # primary doesn't cause 15+ min silent hangs from retry-loop pile-up.
+    try:
+        from hermes_cli.config import load_config as _load_eft_config
+        _eft_cfg = _load_eft_config() or {}
+        _eft_agent = _eft_cfg.get("agent", {}) or {}
+        agent._eager_fallback_on_timeout = bool(
+            _eft_agent.get("eager_fallback_on_timeout", False)
+        )
+    except Exception:
+        agent._eager_fallback_on_timeout = False
+
     if agent._fallback_chain and not agent.quiet_mode:
         if len(agent._fallback_chain) == 1:
             fb = agent._fallback_chain[0]

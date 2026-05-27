@@ -2864,6 +2864,31 @@ def run_conversation(
                             primary_recovery_attempted = False
                             continue
 
+                # Eager fallback for stream-stall / connection timeouts
+                # (issue #22277).  When the stale detector kills a hung
+                # stream, the error classifies as FailoverReason.timeout
+                # and the loop normally retries the same broken primary
+                # — burning the full retry budget (3+ stale kills × 5min
+                # each = 15+ min silent hang).  When the user has
+                # configured a fallback chain AND opted in via
+                # `agent.eager_fallback_on_timeout`, switch to fallback
+                # after the first stale kill instead of compounding.
+                is_timeout_eager = (
+                    classified.reason == FailoverReason.timeout
+                    and getattr(agent, "_eager_fallback_on_timeout", False)
+                    and agent._fallback_index < len(agent._fallback_chain)
+                )
+                if is_timeout_eager:
+                    agent._emit_status(
+                        "⚠️ Provider stalled (stream/call timeout) — "
+                        "switching to fallback provider..."
+                    )
+                    if agent._try_activate_fallback(reason=classified.reason):
+                        retry_count = 0
+                        compression_attempts = 0
+                        primary_recovery_attempted = False
+                        continue
+
                 # ── Nous Portal: record rate limit & skip retries ─────
                 # When Nous returns a 429 that is a genuine account-
                 # level rate limit, record the reset time to a shared
