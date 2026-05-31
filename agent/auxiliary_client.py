@@ -664,7 +664,23 @@ class _CodexCompletionsAdapter:
         # agent/transports/codex.py::build_kwargs() so auxiliary callers
         # that configure reasoning via auxiliary.<task>.extra_body get the
         # same behavior as the main agent's Codex transport.
-        extra_body = kwargs.get("extra_body") or {}
+        extra_body = dict(kwargs.get("extra_body") or {})
+        structured_intent = _pop_hermes_structured_output(extra_body)
+        if structured_intent is not None:
+            resp_kwargs["text"] = _structured_output_responses_text(structured_intent)
+        else:
+            response_format = kwargs.get("response_format")
+            if isinstance(response_format, dict) and response_format.get("type") == "json_schema":
+                json_schema = response_format.get("json_schema")
+                if isinstance(json_schema, dict):
+                    resp_kwargs["text"] = {
+                        "format": {
+                            "type": "json_schema",
+                            "name": json_schema.get("name"),
+                            "schema": json_schema.get("schema") or {},
+                            "strict": bool(json_schema.get("strict", False)),
+                        }
+                    }
         if isinstance(extra_body, dict):
             reasoning_cfg = extra_body.get("reasoning")
             if isinstance(reasoning_cfg, dict):
@@ -4835,6 +4851,64 @@ def _convert_openai_images_to_anthropic(messages: list) -> list:
         converted.append({**msg, "content": new_content} if changed else msg)
     return converted
 
+def _pop_hermes_structured_output(extra_body: dict | None) -> dict[str, Any] | None:
+    if not isinstance(extra_body, dict):
+        return None
+    intent = extra_body.pop("hermes_structured_output", None)
+    if not isinstance(intent, dict):
+        return None
+    if intent.get("type") != "json_schema":
+        return None
+    if not isinstance(intent.get("name"), str) or not isinstance(intent.get("schema"), dict):
+        return None
+    return intent
+
+
+def _structured_output_chat_response_format(intent: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": intent["name"],
+            "schema": intent["schema"],
+            "strict": bool(intent.get("strict", False)),
+        },
+    }
+
+
+def _structured_output_responses_text(intent: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": intent["name"],
+            "schema": intent["schema"],
+            "strict": bool(intent.get("strict", False)),
+        }
+    }
+
+
+def _is_structured_output_unsupported_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        ("unsupported_parameter" in text and ("response_format" in text or "text.format" in text))
+        or "unknown parameter: response_format" in text
+        or "unknown parameter: text" in text
+        or "unknown parameter 'response_format'" in text
+        or "unknown parameter 'text'" in text
+    )
+
+
+def _strip_structured_output_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    retry_kwargs = dict(kwargs)
+    retry_kwargs.pop("response_format", None)
+    retry_kwargs.pop("text", None)
+    extra = dict(retry_kwargs.get("extra_body") or {})
+    extra.pop("hermes_structured_output", None)
+    if extra:
+        retry_kwargs["extra_body"] = extra
+    else:
+        retry_kwargs.pop("extra_body", None)
+    return retry_kwargs
+
 
 
 def _build_call_kwargs(
@@ -4917,6 +4991,15 @@ def _build_call_kwargs(
 
     # Provider-specific extra_body
     merged_extra = dict(extra_body or {})
+    structured_intent = _pop_hermes_structured_output(merged_extra)
+    _effective_base = base_url or (_current_custom_base_url() if provider == "custom" else "")
+    if structured_intent is not None:
+        if _endpoint_speaks_anthropic_messages(_effective_base):
+            logger.info(
+                "Auxiliary structured output unsupported on native Anthropic wire; using prompt-only JSON instructions"
+            )
+        else:
+            kwargs["response_format"] = _structured_output_chat_response_format(structured_intent)
     if provider == "nous" or auxiliary_is_nous:
         merged_extra.setdefault("tags", []).extend(_nous_portal_tags())
     if merged_extra:
@@ -5087,6 +5170,18 @@ def call_llm(
         return _validate_llm_response(
             client.chat.completions.create(**kwargs), task)
     except Exception as first_err:
+        if _is_structured_output_unsupported_error(first_err) and (
+            "response_format" in kwargs
+            or "text" in kwargs
+            or "hermes_structured_output" in (kwargs.get("extra_body") or {})
+        ):
+            retry_kwargs = _strip_structured_output_kwargs(kwargs)
+            logger.info(
+                "Auxiliary %s: provider rejected structured output; retrying once prompt-only",
+                task or "call",
+            )
+            return _validate_llm_response(
+                client.chat.completions.create(**retry_kwargs), task)
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
