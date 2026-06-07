@@ -446,9 +446,14 @@ class TestCodexCompletionsAdapter:
                 return response
 
         class _Responses:
-            def stream(self, **kwargs):
+            def create(self, **kwargs):
                 captured.update(kwargs)
-                return _Stream()
+                return iter([
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(output=[], status="completed"),
+                    )
+                ])
 
         real_client = MagicMock()
         real_client.responses = _Responses()

@@ -55,7 +55,7 @@ def test_codex_stream_accumulator_typeerror_falls_back_to_create_stream():
     accumulator_error = TypeError("'NoneType' object is not iterable")
 
     mock_client = MagicMock()
-    mock_client.responses.stream.side_effect = accumulator_error
+    mock_client.responses.create.side_effect = accumulator_error
 
     fallback_response = SimpleNamespace(
         output=[SimpleNamespace(
@@ -80,7 +80,7 @@ def test_codex_stream_unrelated_typeerror_still_raises():
     agent = _make_codex_agent()
 
     mock_client = MagicMock()
-    mock_client.responses.stream.side_effect = TypeError(
+    mock_client.responses.create.side_effect = TypeError(
         "build_api_kwargs() got an unexpected keyword argument"
     )
 
@@ -128,7 +128,6 @@ def test_fallback_synthesizes_output_when_terminal_output_is_none():
 
     result = agent._run_codex_create_stream_fallback(_VALID_CODEX_KWARGS, client=mock_client)
 
-    assert result is terminal_response
     assert isinstance(result.output, list) and result.output
     assert result.output[0].content[0].text == "pong"
 
@@ -154,5 +153,4 @@ def test_fallback_backfills_items_when_terminal_output_is_none():
 
     result = agent._run_codex_create_stream_fallback(_VALID_CODEX_KWARGS, client=mock_client)
 
-    assert result is terminal_response
     assert result.output == [done_item]

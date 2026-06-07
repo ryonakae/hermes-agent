@@ -1858,6 +1858,29 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         filtered.append(msg)
     messages = filtered
 
+    # Drop assistant tool calls with empty/missing function.name before
+    # orphan reconciliation. Responses adapters drop malformed calls but keep
+    # matching tool outputs, which otherwise produces provider-side "No tool
+    # call found for function call output" errors.
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        tool_calls = msg.get("tool_calls") or []
+        if not tool_calls:
+            continue
+        cleaned = []
+        for tc in tool_calls:
+            name = _ra().AIAgent._get_tool_call_name_static(tc)
+            if isinstance(name, str) and name.strip():
+                cleaned.append(tc)
+                continue
+            _ra().logger.warning(
+                "Pre-call sanitizer: dropping tool_call with empty function.name (id=%s)",
+                _ra().AIAgent._get_tool_call_id_static(tc),
+            )
+        if len(cleaned) != len(tool_calls):
+            msg["tool_calls"] = cleaned
+
     surviving_call_ids: set = set()
     for msg in messages:
         if msg.get("role") == "assistant":

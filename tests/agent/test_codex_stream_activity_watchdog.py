@@ -57,7 +57,7 @@ def _make_codex_agent(tmp_path, monkeypatch, *, stale_timeout: float = 1.0):
     )
     agent._emitted_status: list = []
     monkeypatch.setattr(
-        agent, "_emit_status", lambda msg: agent._emitted_status.append(msg)
+        agent, "_buffer_status", lambda msg: agent._emitted_status.append(msg)
     )
     return agent
 
