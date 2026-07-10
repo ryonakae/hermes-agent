@@ -116,7 +116,7 @@ async def test_goal_verdict_done_sent_via_adapter_send(hermes_home):
     mgr = GoalManager(session_entry.session_id)
     mgr.set("ship the feature")
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("done", "the feature shipped", False)):
+    with patch("hermes_cli.goals.judge_goal", return_value=("done", "the feature shipped", False, None)):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -171,7 +171,7 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
     mgr = GoalManager(session_entry.session_id)
     mgr.set("polish the docs")
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False)):
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False, None)):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -199,7 +199,7 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     state.turns_used = 2
     save_goal(session_entry.session_id, state)
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "keep going", False)):
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "keep going", False, None)):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -246,7 +246,7 @@ async def test_goal_verdict_survives_adapter_without_send(hermes_home):
 
     runner.adapters[Platform.TELEGRAM] = _NoSendAdapter()
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("done", "ok", False)):
+    with patch("hermes_cli.goals.judge_goal", return_value=("done", "ok", False, None)):
         # must not raise
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
