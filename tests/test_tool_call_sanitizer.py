@@ -1,4 +1,4 @@
-"""Unit tests for the Pass-0 sanitizer that drops tool_calls with empty function.name.
+"""Unit tests for repairing tool_calls with empty function.name.
 
 Regression coverage for the bug where some providers emit a streamed tool_call
 with ``id="call_xxx"`` but ``function.name=""``.  Such malformed calls were
@@ -7,9 +7,9 @@ previously silently dropped by the Responses-API adapter while the matching
 
     No tool call found for function call output with call_id ...
 
-The fix lives in ``AIAgent._sanitize_api_messages`` (run_agent.py) — Pass 0
-strips the malformed call so the existing orphan-result logic then removes
-its (now unpaired) ``tool`` message.
+The fix lives in ``AIAgent._sanitize_api_messages`` (run_agent.py). It renames
+the malformed call to ``invalid_tool_call`` so the call and matching result
+stay paired and the model can receive the anti-priming error result.
 """
 
 from __future__ import annotations
@@ -47,9 +47,9 @@ def tool_result(call_id: str, content: str = "ok") -> dict:
 # ---------------------------------------------------------------------------
 
 class TestEmptyFunctionNameSanitizer:
-    """Phase 0 — strip tool_calls whose function.name is empty/missing."""
+    """Repair tool_calls whose function.name is empty or missing."""
 
-    def test_empty_name_call_dropped_with_orphan_result(self):
+    def test_empty_name_call_repaired_with_result_preserved(self):
         msgs = [
             {"role": "user", "content": "do stuff"},
             {"role": "assistant", "tool_calls": [
@@ -61,17 +61,17 @@ class TestEmptyFunctionNameSanitizer:
         ]
         out = AIAgent._sanitize_api_messages(msgs)
 
-        # Good call survives, bad call is gone, its tool_result is gone too.
         assistant_msgs = [m for m in out if m.get("role") == "assistant"]
         assert len(assistant_msgs) == 1
         surviving_call_ids = [tc["id"] for tc in assistant_msgs[0]["tool_calls"]]
-        assert surviving_call_ids == ["c_good"]
+        assert surviving_call_ids == ["c_good", "c_bad"]
+        names = [tc["function"]["name"] for tc in assistant_msgs[0]["tool_calls"]]
+        assert names == ["terminal", "invalid_tool_call"]
 
         tool_msgs = [m for m in out if m.get("role") == "tool"]
-        assert len(tool_msgs) == 1
-        assert tool_msgs[0]["tool_call_id"] == "c_good"
+        assert [m["tool_call_id"] for m in tool_msgs] == ["c_good", "c_bad"]
 
-    def test_missing_function_field_dropped(self):
+    def test_missing_function_field_repaired(self):
         msgs = [
             {"role": "assistant", "tool_calls": [
                 assistant_dict_call("c1", name="read_file"),
@@ -82,9 +82,11 @@ class TestEmptyFunctionNameSanitizer:
         ]
         out = AIAgent._sanitize_api_messages(msgs)
         ids_left = {m.get("tool_call_id") for m in out if m.get("role") == "tool"}
-        assert ids_left == {"c1"}
+        assert ids_left == {"c1", "c_no_fn"}
+        assistant = next(m for m in out if m.get("role") == "assistant")
+        assert assistant["tool_calls"][1]["function"]["name"] == "invalid_tool_call"
 
-    def test_whitespace_only_name_dropped(self):
+    def test_whitespace_only_name_repaired(self):
         msgs = [
             {"role": "assistant", "tool_calls": [
                 assistant_dict_call("c_ws", name="   "),
@@ -92,18 +94,11 @@ class TestEmptyFunctionNameSanitizer:
             tool_result("c_ws"),
         ]
         out = AIAgent._sanitize_api_messages(msgs)
-        # Stub will be inserted for orphaned call — but here the call itself
-        # is removed as malformed, so no stub and no tool result.
-        assert all(m.get("tool_call_id") != "c_ws" for m in out)
-        assert all(
-            not (m.get("role") == "assistant" and any(
-                (tc.get("function") or {}).get("name", "").strip() == ""
-                for tc in (m.get("tool_calls") or [])
-            ))
-            for m in out
-        )
+        assistant = next(m for m in out if m.get("role") == "assistant")
+        assert assistant["tool_calls"][0]["function"]["name"] == "invalid_tool_call"
+        assert any(m.get("tool_call_id") == "c_ws" for m in out)
 
-    def test_object_style_tool_call_with_empty_name_dropped(self):
+    def test_object_style_tool_call_with_empty_name_repaired(self):
         msgs = [
             {"role": "assistant", "tool_calls": [
                 assistant_obj_call("c_ok", name="search_files"),
@@ -114,7 +109,9 @@ class TestEmptyFunctionNameSanitizer:
         ]
         out = AIAgent._sanitize_api_messages(msgs)
         tool_ids = {m.get("tool_call_id") for m in out if m.get("role") == "tool"}
-        assert tool_ids == {"c_ok"}
+        assert tool_ids == {"c_ok", "c_obj_bad"}
+        assistant = next(m for m in out if m.get("role") == "assistant")
+        assert assistant["tool_calls"][1].function.name == "invalid_tool_call"
 
     def test_all_normal_calls_unchanged_regression(self):
         msgs = [
@@ -166,9 +163,15 @@ class TestEmptyFunctionNameSanitizer:
             for tc in m["tool_calls"]
         }
         all_result_ids = {m["tool_call_id"] for m in out if m.get("role") == "tool"}
-        assert "a_bad" not in all_call_ids
-        assert "a_bad" not in all_result_ids
-        assert {"a1", "a2"}.issubset(all_call_ids)
+        assert all_call_ids == {"a1", "a2", "a_bad"}
+        assert all_result_ids == {"a1", "a2", "a_bad"}
+        repaired = next(
+            tc
+            for m in out if m.get("role") == "assistant"
+            for tc in (m.get("tool_calls") or [])
+            if tc["id"] == "a_bad"
+        )
+        assert repaired["function"]["name"] == "invalid_tool_call"
 
 
 # ---------------------------------------------------------------------------
