@@ -2826,10 +2826,110 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
+    def test_multimodal_fts_uses_text_projection(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            content = [
+                {"type": "text", "text": "multimodal marker"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                },
+            ]
+            message_id = db.append_message("s1", role="user", content=content)
 
+            row = db._conn.execute(
+                "SELECT content, fts_content FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+            assert row["content"].startswith("\x00json:")
+            assert row["fts_content"] == "multimodal marker"
+            assert db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_trigram "
+                "WHERE messages_fts_trigram MATCH 'marker'"
+            ).fetchone()[0] == 1
+            assert "image_url" not in db._conn.execute(
+                "SELECT content FROM messages_fts_trigram WHERE rowid = ?",
+                (message_id,),
+            ).fetchone()[0]
+            assert db._conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        finally:
+            db.close()
 
+    def test_optimize_rebuilds_pre_projection_trigram_index(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            message_id = db.append_message(
+                "s1",
+                role="user",
+                content=[
+                    {"type": "text", "text": "legacy marker"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,BBBB"},
+                    },
+                ],
+            )
+            conn = db._conn
+            for trigger in hermes_state._FTS_TRIGGERS:
+                if trigger.startswith("messages_fts_trigram_"):
+                    conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+            conn.execute("DROP TABLE messages_fts_trigram")
+            conn.execute(
+                "CREATE VIEW messages_fts_trigram_src AS "
+                "SELECT id, content, tool_name, tool_calls FROM messages "
+                "WHERE role <> 'tool'"
+            )
+            conn.execute(
+                "CREATE VIRTUAL TABLE messages_fts_trigram USING fts5("
+                "content, tool_name, tool_calls, "
+                "content='messages_fts_trigram_src', content_rowid='id', "
+                "tokenize='trigram')"
+            )
+            conn.execute(
+                "UPDATE messages SET fts_content = NULL WHERE id = ?",
+                (message_id,),
+            )
+            conn.execute(
+                "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+                "VALUES('rebuild')"
+            )
+            db.set_meta("fts_storage_version", "1", cursor=conn)
+            conn.commit()
+        finally:
+            db.close()
 
-
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db.get_meta("fts_storage_version") == "1"
+            assert db.get_meta("fts_optimize_available") == "1"
+            assert db.fts_optimize_available() is True
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert db.get_meta("fts_storage_version") == str(
+                hermes_state.FTS_STORAGE_VERSION
+            )
+            row = db._conn.execute(
+                "SELECT fts_content FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            assert row["fts_content"] == "legacy marker"
+            assert "fts_content" in db._conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'view' AND name = 'messages_fts_trigram_src'"
+            ).fetchone()[0]
+            assert "image_url" not in db._conn.execute(
+                "SELECT content FROM messages_fts_trigram WHERE rowid = ?",
+                (message_id,),
+            ).fetchone()[0]
+            assert db._conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            assert db.fts_optimize_available() is False
+        finally:
+            db.close()
 
     def _simulate_pre_fix_demote_crash_window(self, db):
         """Replay the pre-fix demote crash window: trash + empty v23 schema,

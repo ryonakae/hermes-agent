@@ -1099,16 +1099,9 @@ class SessionSchemaMixin:
                 self._dedupe_legacy_system_prompts(cursor)
 
             # The FTS storage layout is versioned independently of the main
-            # schema (see the v23 note above). Stamp the current layout so the
-            # main version can always advance: a fresh/optimized DB is at
-            # FTS_STORAGE_VERSION; a legacy DB is left at whatever it had
-            # (absent/0) until `optimize-storage` runs. An INTERRUPTED
-            # optimize (legacy vtables already demoted, but rebuild markers
-            # or demoted trash tables still present, or an empty external
-            # index against non-empty messages) is NOT stamped either —
-            # the marker is the source of truth for "fully optimized", and
-            # `fts_optimize_available()` keeps offering the resume until the
-            # transition actually completes.
+            # schema. Stamp only a fresh/current layout. A legacy DB, an older
+            # multimodal projection, or an interrupted optimize keeps its
+            # prior marker until foreground `optimize-storage` completes.
             if (
                 fts5_available
                 and not self._db_has_legacy_inline_fts(cursor)
@@ -1119,9 +1112,12 @@ class SessionSchemaMixin:
                 and not self._has_fts_trash(cursor)
                 and not self._fts_external_index_empty_with_messages(cursor)
             ):
-                self.set_meta(
-                    "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor
-                )
+                if self._fts_trigram_needs_multimodal_projection(cursor):
+                    self.set_meta("fts_optimize_available", "1", cursor=cursor)
+                else:
+                    self.set_meta(
+                        "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor
+                    )
 
             # Advance schema_version to current for ALL non-FTS-layout
             # migrations. This is deliberately NOT gated on the FTS opt-in —

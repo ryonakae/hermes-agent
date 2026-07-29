@@ -78,6 +78,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _PREVIEW_MAX_CHARS,
     _PREVIEW_SCAFFOLD_WINDOW,
     _PREVIEW_SCAFFOLDED_SQL,
+    _fts_index_content_sql,
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
@@ -2183,9 +2184,9 @@ def _repair_state_db_schema_locked(
 # an external-content 'delete' op for a rowid the index never held is the
 # canonical FTS5 index-corruption hazard the v23 marker gating exists to
 # prevent.
-FTS_CJK_TABLE_SQL = """
+FTS_CJK_TABLE_SQL = f"""
 CREATE VIEW IF NOT EXISTS messages_fts_cjk_src AS
-    SELECT id, role, content, tool_name, tool_calls
+    SELECT id, role, {_fts_index_content_sql('content', 'fts_content')} AS content, tool_name, tool_calls
     FROM messages
     WHERE role <> 'tool';
 
@@ -2199,7 +2200,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_cjk USING fts5(
 );
 """
 
-FTS_CJK_TRIGGER_SQL = """
+FTS_CJK_TRIGGER_SQL = f"""
 CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_insert AFTER INSERT ON messages
 WHEN new.role <> 'tool'
    AND (new.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
@@ -2208,7 +2209,7 @@ WHEN new.role <> 'tool'
                             WHERE key = 'fts_cjk_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_cjk(rowid, content, tool_name, tool_calls)
-    VALUES (new.id, new.content, new.tool_name, new.tool_calls);
+    VALUES (new.id, {_fts_index_content_sql('new.content', 'new.fts_content')}, new.tool_name, new.tool_calls);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_delete AFTER DELETE ON messages
@@ -2219,7 +2220,7 @@ WHEN old.role <> 'tool'
                             WHERE key = 'fts_cjk_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_cjk(messages_fts_cjk, rowid, content, tool_name, tool_calls)
-    VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
+    VALUES ('delete', old.id, {_fts_index_content_sql('old.content', 'old.fts_content')}, old.tool_name, old.tool_calls);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_update
@@ -2234,10 +2235,10 @@ WHEN (old.content IS NOT new.content
                             WHERE key = 'fts_cjk_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_cjk(messages_fts_cjk, rowid, content, tool_name, tool_calls)
-    SELECT 'delete', old.id, old.content, old.tool_name, old.tool_calls
+    SELECT 'delete', old.id, {_fts_index_content_sql('old.content', 'old.fts_content')}, old.tool_name, old.tool_calls
     WHERE old.role <> 'tool';
     INSERT INTO messages_fts_cjk(rowid, content, tool_name, tool_calls)
-    SELECT new.id, new.content, new.tool_name, new.tool_calls
+    SELECT new.id, {_fts_index_content_sql('new.content', 'new.fts_content')}, new.tool_name, new.tool_calls
     WHERE new.role <> 'tool';
 END;
 """
@@ -7918,6 +7919,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return content
         return content
 
+    @classmethod
+    def _fts_content(cls, content: Any) -> Optional[str]:
+        """Return searchable text projected from stored multimodal content.
+
+        The canonical ``content`` value remains unchanged for replay. Image
+        URLs and the NUL-prefixed JSON envelope are deliberately excluded from
+        substring indexes.
+        """
+        decoded = cls._decode_content(content)
+        if isinstance(decoded, list):
+            text_parts: List[str] = []
+            for part in decoded:
+                if not isinstance(part, dict) or part.get("type") != "text":
+                    continue
+                text = part.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+            return " ".join(text_parts).replace("\x00", " ")
+        if isinstance(decoded, dict):
+            text = decoded.get("text") if decoded.get("type") == "text" else ""
+            return text.replace("\x00", " ") if isinstance(text, str) else ""
+        return None
+
     @staticmethod
     def _encode_display_metadata(display_metadata: Any) -> Optional[str]:
         """Serialize ``display_metadata`` for its TEXT column without double-encoding.
@@ -8088,6 +8112,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
+        fts_content = self._fts_content(stored_content)
 
         message_timestamp = time.time()
         if timestamp is not None:
@@ -8109,15 +8134,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn, session_id, compression_lock_holder
             )
             cursor = conn.execute(
-                """INSERT INTO messages (session_id, role, content, tool_call_id,
+                """INSERT INTO messages (session_id, role, content, fts_content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
                     stored_content,
+                    fts_content,
                     tool_call_id,
                     tool_calls_json,
                     _scrub_surrogates(tool_name),
@@ -8530,17 +8556,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
             api_content = msg.get("api_content")
+            stored_content = self._encode_content(msg.get("content"))
 
             cur = conn.execute(
-                """INSERT INTO messages (session_id, role, content, tool_call_id,
+                """INSERT INTO messages (session_id, role, content, fts_content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
-                    self._encode_content(msg.get("content")),
+                    stored_content,
+                    self._fts_content(stored_content),
                     msg.get("tool_call_id"),
                     tool_calls_json,
                     _scrub_surrogates(msg.get("tool_name")),
@@ -10616,7 +10644,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if ids:
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
-                    f"UPDATE messages SET content = '' WHERE id IN ({placeholders})",
+                    f"UPDATE messages SET content = '', fts_content = '' "
+                    f"WHERE id IN ({placeholders})",
                     ids,
                 )
             return ids

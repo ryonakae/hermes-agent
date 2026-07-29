@@ -12490,12 +12490,13 @@ def main():
 
     sessions_optimize_storage = sessions_subparsers.add_parser(
         "optimize-storage",
-        help="Migrate the search index to the compact v23 layout (reclaims disk on large DBs)",
+        help="Rebuild the compact search index and omit multimodal image payloads",
         description=(
-            "Rebuild the full-text search index in the compact v23 "
-            "external-content layout. On large databases this reclaims a "
-            "large fraction of state.db (the old layout stored duplicate "
-            "copies of every message and indexed tool output). Runs "
+            "Rebuild the full-text search index in the compact "
+            "external-content layout. On large databases this can reclaim a "
+            "large fraction of state.db: the old layout stored duplicate "
+            "copies of every message and the current projection omits "
+            "multimodal image payloads. Runs "
             "foreground with a progress bar, throttles so a running gateway "
             "stays responsive, and VACUUMs at the end. Safe to interrupt and "
             "re-run — it resumes where it left off. No conversation data is "
