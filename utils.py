@@ -16,25 +16,6 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
-class _ReadableYamlDumper(yaml.SafeDumper):
-    """YAML dumper tuned for human-edited Hermes config files."""
-
-    def increase_indent(self, flow=False, indentless=False):  # noqa: ARG002
-        return super().increase_indent(flow, False)
-
-
-def _represent_readable_string(dumper: yaml.Dumper, data: str):
-    style = "|" if "\n" in data else None
-    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
-
-
-_ReadableYamlDumper.add_representer(str, _represent_readable_string)
-
-# Backward-compatible public name used by regression tests and callers that
-# only need the indentation behavior.
-IndentDumper = _ReadableYamlDumper
-
-
 TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
 
 
@@ -155,6 +136,41 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     return real_path
 
 
+def atomic_write_text(
+    path: Union[str, Path],
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    tmp_prefix: str = ".tmp_",
+) -> None:
+    """Write *content* to *path* via temp file + fsync + atomic rename.
+
+    Ensures the target file is never left in a partially-written state if
+    the process crashes or is interrupted.  ``atomic_replace`` preserves
+    symlinks and handles cross-device / busy-file fallbacks.
+
+    Used by the memory store, skill manager, and agent importer so that
+    every destructive file rewrite in the codebase shares one implementation.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=tmp_prefix, suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def atomic_json_write(
     path: Union[str, Path],
     data: Any,
@@ -227,6 +243,71 @@ def atomic_json_write(
         raise
 
 
+def warn_if_credential_file_broadly_readable(
+    path: Union[str, Path],
+    *,
+    label: str = "",
+    log: logging.Logger | None = None,
+) -> bool:
+    """Warn (once per call) when a credential file is group/world-readable.
+
+    Secret-bearing files that users create by hand (or that older Hermes
+    versions wrote without an explicit mode) commonly end up 0o644 under the
+    default umask. This helper is the shared read-time check for that class:
+    call it before loading any token/credential file so the owner gets a
+    remediation hint in the logs.
+
+    Returns True when a warning was emitted. No-ops (returns False) on
+    platforms without POSIX permission bits semantics (best effort), when the
+    file is missing, or when permissions are already tight.
+    """
+    p = Path(path)
+    _log = log or logger
+    try:
+        file_mode = p.stat().st_mode
+    except OSError:
+        return False
+    if os.name != "posix":
+        # Windows ACLs don't map onto POSIX group/other bits; st_mode there
+        # is synthesized and would false-positive.
+        return False
+    if not (file_mode & (stat.S_IRGRP | stat.S_IROTH)):
+        return False
+    _log.warning(
+        "%s%s is group/world-readable (mode 0%o) and contains secrets. "
+        "Run: chmod 600 %s",
+        f"{label} " if label else "",
+        p.name,
+        stat.S_IMODE(file_mode),
+        p,
+    )
+    return True
+
+
+class IndentDumper(yaml.SafeDumper):
+    """PyYAML dumper that indents list items under mapping keys (2-space).
+
+    Default PyYAML emits "indentless" sequences — list items start at the
+    same column as their parent mapping key.  ``ruamel.yaml`` (used by
+    :func:`atomic_roundtrip_yaml_update`) emits 2-space-indented sequences.
+    Mixing both styles in the same ``config.yaml`` produces a file that
+    stricter parsers like ``js-yaml`` reject with ``bad indentation of a
+    mapping entry``.  Forcing ``indentless=False`` aligns the two
+    serializers so all write paths emit byte-identical layouts (#31999).
+    """
+
+    def increase_indent(self, flow=False, indentless=False):  # noqa: ARG002
+        return super().increase_indent(flow, False)
+
+
+def _represent_readable_string(dumper: yaml.Dumper, data: str):
+    style = "|" if "\n" in data else None
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+
+IndentDumper.add_representer(str, _represent_readable_string)
+
+
 def atomic_yaml_write(
     path: Union[str, Path],
     data: Any,
@@ -263,13 +344,16 @@ def atomic_yaml_write(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             # allow_unicode=True writes emoji/kaomoji (e.g. personalities, skin
-            # cursors) as real UTF-8 instead of fragile escape sequences. The
-            # custom dumper also keeps multiline strings as readable block scalars
-            # and emits indented lists compatible with stricter YAML parsers.
+            # cursors) as real UTF-8 instead of fragile escape sequences. Without
+            # it, PyYAML emits astral-plane chars as `\UXXXXXXXX` (8-digit) escapes
+            # inside multi-line double-quoted strings wrapped with `\`
+            # continuations — a structure that stricter/non-PyYAML parsers and
+            # hand-edits routinely break into unclosed quotes, corrupting the whole
+            # config (GitHub #51356).
             yaml.dump(
                 data,
                 f,
-                Dumper=_ReadableYamlDumper,
+                Dumper=IndentDumper,
                 default_flow_style=default_flow_style,
                 sort_keys=sort_keys,
                 allow_unicode=True,
