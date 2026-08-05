@@ -420,6 +420,29 @@ async def test_manager_malformed_201_token_response_does_not_expose_body(
 
 
 @pytest.mark.asyncio
+async def test_manager_token_read_error_does_not_expose_body(tmp_path, monkeypatch):
+    import httpx
+    from mcp.client.auth.oauth2 import OAuthTokenError
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+
+    class _ReadErrorResponse:
+        status_code = 201
+
+        async def aread(self):
+            raise httpx.ReadError("access-secret refresh-secret")
+
+    with pytest.raises(OAuthTokenError, match="^Invalid token response$") as exc_info:
+        await provider._handle_token_response(_ReadErrorResponse())
+
+    assert "access-secret" not in str(exc_info.value)
+    assert "refresh-secret" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
 async def test_manager_malformed_201_refresh_response_clears_tokens(
     tmp_path, monkeypatch, caplog
 ):

@@ -182,10 +182,11 @@ def _make_hermes_provider_class() -> Optional[type]:
             if 200 <= response.status_code < 300:
                 from mcp.client.auth.utils import handle_token_response_scopes
                 from mcp.client.auth.oauth2 import OAuthTokenError
+                from httpx import HTTPError
 
                 try:
                     token_response = await handle_token_response_scopes(response)
-                except OAuthTokenError:
+                except (HTTPError, OAuthTokenError):
                     raise OAuthTokenError("Invalid token response") from None
                 self.context.current_tokens = token_response
                 self.context.update_token_expiry(token_response)
