@@ -1120,7 +1120,7 @@ def _get_hermes_oauth_provider_class() -> type | None:
                 await self.context.storage.set_tokens(token_response)
                 return True
             except ValidationError:
-                logger.exception("Invalid refresh response")
+                logger.warning("Invalid refresh response: %s", response.status_code)
                 self.context.clear_tokens()
                 return False
 

@@ -235,7 +235,10 @@ class TestBuildOAuthAuth:
         assert json.loads(token_path.read_text())["access_token"] == "access-token"
 
     @pytest.mark.asyncio
-    async def test_malformed_201_refresh_response_clears_tokens(self, tmp_path, monkeypatch):
+    async def test_malformed_201_refresh_response_clears_tokens(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
         import httpx
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -244,12 +247,15 @@ class TestBuildOAuthAuth:
         assert provider is not None
         provider.context.current_tokens = object()
 
-        result = await provider._handle_refresh_response(
-            httpx.Response(201, content=b'{"not_a_token": true}')
+        response = httpx.Response(
+            201, content=b'{"refresh_token": "refresh-secret"}'
         )
+        with caplog.at_level(logging.WARNING, logger="tools.mcp_oauth"):
+            result = await provider._handle_refresh_response(response)
 
         assert result is False
         assert provider.context.current_tokens is None
+        assert "refresh-secret" not in caplog.text
 
 
 # ---------------------------------------------------------------------------

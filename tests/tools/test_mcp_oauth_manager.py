@@ -397,16 +397,25 @@ async def test_manager_provider_token_exchange_includes_dcr_secret(tmp_path, mon
 
 
 @pytest.mark.asyncio
-async def test_manager_malformed_201_refresh_response_clears_tokens(tmp_path, monkeypatch):
+async def test_manager_malformed_201_refresh_response_clears_tokens(
+    tmp_path, monkeypatch, caplog
+):
+    import logging
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = _provider_with_token_endpoint(
         tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
     )
     provider.context.current_tokens = object()
 
-    result = await provider._handle_refresh_response(
-        _fake_response(201, "https://idp.example.com/oauth/token", b'{"not_a_token": true}')
+    response = _fake_response(
+        201,
+        "https://idp.example.com/oauth/token",
+        b'{"refresh_token": "refresh-secret"}',
     )
+    with caplog.at_level(logging.WARNING, logger="tools.mcp_oauth_manager"):
+        result = await provider._handle_refresh_response(response)
 
     assert result is False
     assert provider.context.current_tokens is None
+    assert "refresh-secret" not in caplog.text
