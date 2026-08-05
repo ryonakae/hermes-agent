@@ -235,6 +235,28 @@ class TestBuildOAuthAuth:
         assert json.loads(token_path.read_text())["access_token"] == "access-token"
 
     @pytest.mark.asyncio
+    async def test_malformed_201_token_response_does_not_expose_body(
+        self, tmp_path, monkeypatch
+    ):
+        import httpx
+        from mcp.client.auth.oauth2 import OAuthTokenError
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+        provider = build_oauth_auth("supabase", "https://mcp.supabase.com/mcp")
+        assert provider is not None
+
+        with pytest.raises(OAuthTokenError, match="^Invalid token response$") as exc_info:
+            await provider._handle_token_response(
+                httpx.Response(
+                    201,
+                    content=b'{"access_token": {"secret": "access-secret"}}',
+                )
+            )
+
+        assert "access-secret" not in str(exc_info.value)
+
+    @pytest.mark.asyncio
     async def test_malformed_201_refresh_response_clears_tokens(
         self, tmp_path, monkeypatch, caplog
     ):
@@ -256,6 +278,27 @@ class TestBuildOAuthAuth:
         assert result is False
         assert provider.context.current_tokens is None
         assert "refresh-secret" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_refresh_read_error_clears_tokens(self, tmp_path, monkeypatch):
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+        provider = build_oauth_auth("supabase", "https://mcp.supabase.com/mcp")
+        assert provider is not None
+        provider.context.current_tokens = object()
+
+        class _ReadErrorResponse:
+            status_code = 201
+
+            async def aread(self):
+                raise httpx.ReadError("body read failed")
+
+        result = await provider._handle_refresh_response(_ReadErrorResponse())
+
+        assert result is False
+        assert provider.context.current_tokens is None
 
 
 # ---------------------------------------------------------------------------

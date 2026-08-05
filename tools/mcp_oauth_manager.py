@@ -181,8 +181,12 @@ def _make_hermes_provider_class() -> Optional[type]:
             """Accept any 2xx token response and avoid leaking token bodies in errors."""
             if 200 <= response.status_code < 300:
                 from mcp.client.auth.utils import handle_token_response_scopes
+                from mcp.client.auth.oauth2 import OAuthTokenError
 
-                token_response = await handle_token_response_scopes(response)
+                try:
+                    token_response = await handle_token_response_scopes(response)
+                except OAuthTokenError:
+                    raise OAuthTokenError("Invalid token response") from None
                 self.context.current_tokens = token_response
                 self.context.update_token_expiry(token_response)
                 await self.context.storage.set_tokens(token_response)
@@ -200,6 +204,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                 return False
 
             from mcp.shared.auth import OAuthToken
+            from httpx import HTTPError
             from pydantic import ValidationError
 
             try:
@@ -209,7 +214,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                 self.context.update_token_expiry(token_response)
                 await self.context.storage.set_tokens(token_response)
                 return True
-            except ValidationError:
+            except (HTTPError, ValidationError):
                 logger.warning("Invalid refresh response: %s", response.status_code)
                 self.context.clear_tokens()
                 return False
