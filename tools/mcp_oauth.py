@@ -1048,64 +1048,79 @@ def _paste_callback_reader(result: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-class HermesOAuthClientProvider(OAuthClientProvider):
-    """OAuth provider with pragmatic fixes for real-world MCP providers.
+HermesOAuthClientProvider: Any = None
 
-    Supabase MCP dynamic registration returns ``client_secret`` but omits
-    ``token_endpoint_auth_method``. The upstream MCP SDK treats the missing
-    method as ``none`` and therefore omits ``client_secret`` from the token
-    request, causing Supabase to reject the exchange and the browser to show
-    the authorization page again. Coerce the in-memory client info right before
-    token/refresh requests as well as persisting the fixed shape in storage.
-    """
 
-    def _coerce_client_secret_post(self) -> None:
-        info = getattr(self.context, "client_info", None)
-        if not info or not getattr(info, "client_secret", None):
-            return
-        method = getattr(info, "token_endpoint_auth_method", None)
-        if method not in (None, "none", ""):
-            return
-        data = info.model_dump(mode="json", exclude_none=True)
-        data["token_endpoint_auth_method"] = "client_secret_post"
-        self.context.client_info = OAuthClientInformationFull.model_validate(data)
+def _get_hermes_oauth_provider_class() -> type | None:
+    global HermesOAuthClientProvider
+    if HermesOAuthClientProvider is not None:
+        return HermesOAuthClientProvider
+    if not _ensure_sdk_loaded():
+        return None
 
-    async def _exchange_token_authorization_code(self, *args: Any, **kwargs: Any):
-        self._coerce_client_secret_post()
-        return await super()._exchange_token_authorization_code(*args, **kwargs)
+    class _HermesOAuthClientProvider(OAuthClientProvider):
+        """OAuth provider with pragmatic fixes for real-world MCP providers.
 
-    async def _refresh_token(self):
-        self._coerce_client_secret_post()
-        return await super()._refresh_token()
+        Supabase MCP dynamic registration returns ``client_secret`` but omits
+        ``token_endpoint_auth_method``. The upstream MCP SDK treats the missing
+        method as ``none`` and therefore omits ``client_secret`` from the token
+        request, causing Supabase to reject the exchange and the browser to show
+        the authorization page again. Coerce the in-memory client info right before
+        token/refresh requests as well as persisting the fixed shape in storage.
+        """
 
-    async def _handle_token_response(self, response):
-        """Accept any 2xx token response and avoid leaking token bodies in errors."""
-        if 200 <= response.status_code < 300:
-            from mcp.client.auth.utils import handle_token_response_scopes
+        def _coerce_client_secret_post(self) -> None:
+            info = getattr(self.context, "client_info", None)
+            if not info or not getattr(info, "client_secret", None):
+                return
+            method = getattr(info, "token_endpoint_auth_method", None)
+            if method not in (None, "none", ""):
+                return
+            data = info.model_dump(mode="json", exclude_none=True)
+            data["token_endpoint_auth_method"] = "client_secret_post"
+            self.context.client_info = OAuthClientInformationFull.model_validate(data)
 
-            token_response = await handle_token_response_scopes(response)
+        async def _exchange_token_authorization_code(self, *args: Any, **kwargs: Any):
+            self._coerce_client_secret_post()
+            return await super()._exchange_token_authorization_code(*args, **kwargs)
+
+        async def _refresh_token(self):
+            self._coerce_client_secret_post()
+            return await super()._refresh_token()
+
+        async def _handle_token_response(self, response):
+            """Accept any 2xx token response and avoid leaking token bodies in errors."""
+            if 200 <= response.status_code < 300:
+                from mcp.client.auth.utils import handle_token_response_scopes
+
+                token_response = await handle_token_response_scopes(response)
+                self.context.current_tokens = token_response
+                self.context.update_token_expiry(token_response)
+                await self.context.storage.set_tokens(token_response)
+                return
+
+            from mcp.client.auth.oauth2 import OAuthTokenError
+
+            raise OAuthTokenError(f"Token exchange failed ({response.status_code})")
+
+        async def _handle_refresh_response(self, response) -> bool:
+            """Accept any 2xx refresh response and avoid logging token bodies."""
+            if not (200 <= response.status_code < 300):
+                logger.warning("Token refresh failed: %s", response.status_code)
+                self.context.clear_tokens()
+                return False
+
+            content = await response.aread()
+            token_response = OAuthToken.model_validate_json(content)
             self.context.current_tokens = token_response
             self.context.update_token_expiry(token_response)
             await self.context.storage.set_tokens(token_response)
-            return
+            return True
 
-        from mcp.client.auth.oauth2 import OAuthTokenError
-
-        raise OAuthTokenError(f"Token exchange failed ({response.status_code})")
-
-    async def _handle_refresh_response(self, response) -> bool:
-        """Accept any 2xx refresh response and avoid logging token bodies."""
-        if not (200 <= response.status_code < 300):
-            logger.warning("Token refresh failed: %s", response.status_code)
-            self.context.clear_tokens()
-            return False
-
-        content = await response.aread()
-        token_response = OAuthToken.model_validate_json(content)
-        self.context.current_tokens = token_response
-        self.context.update_token_expiry(token_response)
-        await self.context.storage.set_tokens(token_response)
-        return True
+    _HermesOAuthClientProvider.__name__ = "HermesOAuthClientProvider"
+    _HermesOAuthClientProvider.__qualname__ = "HermesOAuthClientProvider"
+    HermesOAuthClientProvider = _HermesOAuthClientProvider
+    return HermesOAuthClientProvider
 
 
 # ---------------------------------------------------------------------------
@@ -1443,7 +1458,15 @@ def build_oauth_auth(
     )
     callback_handler = _make_callback_waiter(resolved_port)
 
-    return HermesOAuthClientProvider(
+    provider_class = _get_hermes_oauth_provider_class()
+    if provider_class is None:
+        logger.warning(
+            "MCP OAuth requested for '%s' but the provider class is unavailable",
+            server_name,
+        )
+        return None
+
+    return provider_class(
         server_url=server_url,
         client_metadata=client_metadata,
         storage=storage,
