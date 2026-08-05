@@ -200,13 +200,19 @@ def _make_hermes_provider_class() -> Optional[type]:
                 return False
 
             from mcp.shared.auth import OAuthToken
+            from pydantic import ValidationError
 
-            content = await response.aread()
-            token_response = OAuthToken.model_validate_json(content)
-            self.context.current_tokens = token_response
-            self.context.update_token_expiry(token_response)
-            await self.context.storage.set_tokens(token_response)
-            return True
+            try:
+                content = await response.aread()
+                token_response = OAuthToken.model_validate_json(content)
+                self.context.current_tokens = token_response
+                self.context.update_token_expiry(token_response)
+                await self.context.storage.set_tokens(token_response)
+                return True
+            except ValidationError:
+                logger.exception("Invalid refresh response")
+                self.context.clear_tokens()
+                return False
 
         async def _initialize(self) -> None:
             """Load stored tokens + client info AND seed token_expiry_time.

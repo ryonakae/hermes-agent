@@ -234,6 +234,23 @@ class TestBuildOAuthAuth:
         assert token_path.exists()
         assert json.loads(token_path.read_text())["access_token"] == "access-token"
 
+    @pytest.mark.asyncio
+    async def test_malformed_201_refresh_response_clears_tokens(self, tmp_path, monkeypatch):
+        import httpx
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+        provider = build_oauth_auth("supabase", "https://mcp.supabase.com/mcp")
+        assert provider is not None
+        provider.context.current_tokens = object()
+
+        result = await provider._handle_refresh_response(
+            httpx.Response(201, content=b'{"not_a_token": true}')
+        )
+
+        assert result is False
+        assert provider.context.current_tokens is None
+
 
 # ---------------------------------------------------------------------------
 # Utility functions
