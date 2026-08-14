@@ -710,10 +710,16 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
+        read_conn = db._checkout_read_conn()
         traced_connections = [db._conn]
-        if read_conn is not db._conn:
+        if read_conn is not None:
             traced_connections.append(read_conn)
+            # Return the traced connection before invoking search_messages so
+            # _read_ctx checks out this same pooled reader. Calling
+            # _get_read_conn() directly and keeping it checked out made this
+            # assertion observe an unused connection after the bounded pool
+            # replaced the old thread-local reader.
+            db._read_pool.put_nowait(read_conn)
         for conn in traced_connections:
             conn.set_trace_callback(statements.append)
 
