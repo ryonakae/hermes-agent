@@ -166,10 +166,20 @@ class SessionSchemaMixin:
         # destructive candidates so the legacy branch never drops a trigger
         # it does not recreate.
         legacy_layout = self._db_has_legacy_inline_fts(cursor)
-        update_names = (
-            "messages_fts_update",
-            "messages_fts_trigram_update",
-        )
+        trigram_pending = cursor.execute(
+            "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+            (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
+        ).fetchone()
+        update_names = ("messages_fts_update",)
+        if trigram_pending:
+            trigram_triggers = tuple(
+                name
+                for name in _FTS_TRIGGERS
+                if name.startswith("messages_fts_trigram_")
+            )
+            self._drop_named_fts_triggers(cursor, trigram_triggers)
+        else:
+            update_names += ("messages_fts_trigram_update",)
         if not legacy_layout and hasattr(self, "_ensure_fts_cjk_schema"):
             update_names += ("messages_fts_cjk_update",)
         placeholders = ", ".join("?" for _ in update_names)
@@ -196,14 +206,16 @@ class SessionSchemaMixin:
         # Choose legacy vs v23 the same way _init_schema does.
         if legacy_layout:
             self._ensure_fts_schema(cursor, "messages_fts", LEGACY_FTS_SQL)
-            self._ensure_fts_schema(
-                cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
-            )
+            if not trigram_pending:
+                self._ensure_fts_schema(
+                    cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
+                )
         else:
             self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
-            self._ensure_fts_schema(
-                cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-            )
+            if not trigram_pending:
+                self._ensure_fts_schema(
+                    cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                )
             # CJK triggers live on the host SessionDB; only recreate one that
             # this migration actually dropped. ``_ensure_fts_cjk_schema`` is
             # documented never-raises and soft-fails OperationalError by
@@ -347,13 +359,25 @@ class SessionSchemaMixin:
 
     def _recover_stale_fts(self, cursor: sqlite3.Cursor, *, legacy: bool) -> bool:
         """Atomically rebuild stale base/trigram indexes and resume syncing."""
-        try:
-            trigram_status = self._fts_table_probe(cursor, "messages_fts_trigram")
-        except sqlite3.DatabaseError:
-            # A corrupt vtable may fail even a LIMIT 0 probe. It still needs
-            # to be included in the drop-and-recreate recovery below.
-            trigram_status = True
-        include_trigram = trigram_status is True
+        trigram_pending = cursor.execute(
+            "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+            (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
+        ).fetchone()
+        if trigram_pending:
+            # Projection rebuild debt owns the optional trigram surface. Base
+            # stale recovery must not probe, recreate, or reattach its writers;
+            # only the explicit fenced projection rebuild may clear that debt.
+            include_trigram = False
+        else:
+            try:
+                trigram_status = self._fts_table_probe(
+                    cursor, "messages_fts_trigram"
+                )
+            except sqlite3.DatabaseError:
+                # A corrupt vtable may fail even a LIMIT 0 probe. It still needs
+                # to be included in the drop-and-recreate recovery below.
+                trigram_status = True
+            include_trigram = trigram_status is True
 
         drop_sql = "".join(
             f"DROP TRIGGER IF EXISTS {trigger};" for trigger in _FTS_TRIGGERS
@@ -1244,13 +1268,31 @@ class SessionSchemaMixin:
                     cursor, "messages_fts", LEGACY_FTS_SQL
                 )
                 if self._fts_enabled:
-                    trigram_enabled = self._ensure_fts_schema(
-                        cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
-                    )
-                    self._trigram_available = trigram_enabled
+                    projection_pending = cursor.execute(
+                        "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                        (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
+                    ).fetchone()
+                    trigram_enabled = False
+                    if projection_pending:
+                        trigram_triggers = tuple(
+                            name
+                            for name in _FTS_TRIGGERS
+                            if name.startswith("messages_fts_trigram_")
+                        )
+                        self._drop_named_fts_triggers(cursor, trigram_triggers)
+                    else:
+                        trigram_enabled = self._ensure_fts_schema(
+                            cursor,
+                            "messages_fts_trigram",
+                            LEGACY_FTS_TRIGRAM_SQL,
+                        )
+                    self._trigram_available = bool(trigram_enabled)
                     if triggers_need_repair:
                         self._rebuild_legacy_fts_indexes(
-                            cursor, include_trigram=trigram_enabled
+                            cursor,
+                            include_trigram=bool(
+                                trigram_enabled and not projection_pending
+                            ),
                         )
             else:
                 triggers_need_repair = (
@@ -1264,23 +1306,26 @@ class SessionSchemaMixin:
                 # relative to the main FTS table; if it cannot be created,
                 # CJK search falls back to LIKE.
                 if self._fts_enabled:
-                    trigram_enabled = self._ensure_fts_schema(
-                        cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                    )
                     projection_pending = cursor.execute(
                         "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
                         (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
                     ).fetchone()
-                    self._trigram_available = bool(
-                        trigram_enabled and not projection_pending
-                    )
+                    trigram_enabled = False
                     if projection_pending:
                         # Rebuild debt means the existing vtable and current
                         # projection view disagree. Keep it offline and detach
                         # its writers until explicit optimize-storage rebuilds.
-                        for trigger in _FTS_TRIGGERS:
-                            if trigger.startswith("messages_fts_trigram_"):
-                                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                        trigram_triggers = tuple(
+                            name
+                            for name in _FTS_TRIGGERS
+                            if name.startswith("messages_fts_trigram_")
+                        )
+                        self._drop_named_fts_triggers(cursor, trigram_triggers)
+                    else:
+                        trigram_enabled = self._ensure_fts_schema(
+                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                        )
+                    self._trigram_available = bool(trigram_enabled)
                     if triggers_need_repair:
                         if projection_pending:
                             base_triggers = tuple(

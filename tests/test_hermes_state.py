@@ -70,6 +70,20 @@ class _NoTrigramConnection(sqlite3.Connection):
         return super().cursor(factory or _NoTrigramCursor)
 
 
+class _NoTrigramExistingTableCursor(_NoTrigramCursor):
+    """Simulate reopening an existing trigram vtable without its tokenizer."""
+
+    def execute(self, sql, parameters=()):
+        if sql.strip() == "SELECT * FROM messages_fts_trigram LIMIT 0":
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return super().execute(sql, parameters)
+
+
+class _NoTrigramExistingTableConnection(sqlite3.Connection):
+    def cursor(self, factory=None):
+        return super().cursor(factory or _NoTrigramExistingTableCursor)
+
+
 class _DropFailureCursor:
     """Proxy a connection while refusing one trigger DROP."""
 
@@ -403,6 +417,7 @@ class TestSessionLifecycle:
         monkeypatch.setattr("hermes_state.sqlite3.connect", connect_without_trigram)
         db = SessionDB(db_path=db_path)
         try:
+            assert db.get_meta("fts_trigram_projection_rebuild_pending") is None
             db.create_session(session_id="s1", source="cli")
             db.append_message("s1", role="user", content="大别山项目计划书")
             db.append_message("s1", role="user", content="长江大桥设计方案")
@@ -415,6 +430,116 @@ class TestSessionLifecycle:
             assert "大别山" in results[0]["snippet"]
         finally:
             db.close()
+
+    def test_existing_trigram_surface_is_quarantined_without_tokenizer(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "state.db"
+        original = SessionDB(db_path=db_path)
+        original.create_session(session_id="s1", source="cli")
+        original.append_message("s1", role="user", content="before quarantine")
+        assert original._trigram_available is True
+        original.close()
+
+        real_connect = sqlite3.connect
+
+        def connect_without_existing_trigram(*args, **kwargs):
+            kwargs["factory"] = _NoTrigramExistingTableConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "hermes_state.sqlite3.connect", connect_without_existing_trigram
+        )
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened.get_meta("fts_trigram_projection_rebuild_pending") == "1"
+            trigram_triggers = reopened._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_fts_trigram_%'"
+            ).fetchall()
+            assert trigram_triggers == []
+            assert reopened._fts_enabled is True
+            assert reopened._trigram_available is False
+
+            message_id = reopened.append_message(
+                "s1", role="user", content="written after quarantine"
+            )
+            message = next(
+                row for row in reopened.get_messages("s1") if row["id"] == message_id
+            )
+            assert message["content"] == "written after quarantine"
+        finally:
+            reopened.close()
+
+    def test_residual_trigram_triggers_are_quarantined_without_tokenizer(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "state.db"
+        original = SessionDB(db_path=db_path)
+        original.create_session(session_id="s1", source="cli")
+        original._conn.execute("DROP TABLE messages_fts_trigram")
+        residual = original._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_trigram_%'"
+        ).fetchall()
+        assert len(residual) == 3
+        original.close()
+
+        real_connect = sqlite3.connect
+
+        def connect_without_trigram(*args, **kwargs):
+            kwargs["factory"] = _NoTrigramConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr("hermes_state.sqlite3.connect", connect_without_trigram)
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened.get_meta("fts_trigram_projection_rebuild_pending") == "1"
+            live = reopened._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_fts_trigram_%'"
+            ).fetchall()
+            assert live == []
+            assert reopened._fts_enabled is True
+            assert reopened._trigram_available is False
+            reopened.append_message(
+                "s1", role="user", content="written after residual quarantine"
+            )
+        finally:
+            reopened.close()
+
+    def test_residual_trigram_triggers_require_rebuild_on_capable_reopen(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "state.db"
+        original = SessionDB(db_path=db_path)
+        original.create_session(session_id="s1", source="cli")
+        original.append_message("s1", role="user", content="before table loss")
+        original._conn.execute("DROP TABLE messages_fts_trigram")
+        original.close()
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened.get_meta("fts_trigram_projection_rebuild_pending") == "1"
+            assert reopened._fts_enabled is True
+            assert reopened._trigram_available is False
+            live = reopened._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_fts_trigram_%'"
+            ).fetchall()
+            assert live == []
+            assert reopened._conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'messages_fts_trigram'"
+            ).fetchone() is None
+
+            result = reopened.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert reopened.get_meta("fts_trigram_projection_rebuild_pending") is None
+            assert reopened._trigram_available is True
+            assert reopened.search_messages("table loss")
+        finally:
+            reopened.close()
 
 
 # =========================================================================
@@ -2845,6 +2970,62 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
+    def test_v22_pending_trigram_rebuild_stays_offline_on_capable_reopen(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "v22-pending.db"
+        self._build_v22_db(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "INSERT INTO state_meta (key, value) VALUES "
+            "('fts_trigram_projection_rebuild_pending', '1')"
+        )
+        conn.execute(
+            "CREATE TRIGGER messages_fts_update AFTER UPDATE ON messages "
+            "BEGIN SELECT 1; END"
+        )
+        for trigger in (
+            "messages_fts_trigram_insert",
+            "messages_fts_trigram_delete",
+            "messages_fts_trigram_update",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        conn.commit()
+        conn.close()
+
+        ensure_trigram_calls = 0
+        original_ensure = SessionDB._ensure_fts_schema
+
+        def spy_ensure(session_db, cursor, table_name, ddl):
+            nonlocal ensure_trigram_calls
+            if table_name == "messages_fts_trigram":
+                ensure_trigram_calls += 1
+            return original_ensure(session_db, cursor, table_name, ddl)
+
+        monkeypatch.setattr(SessionDB, "_ensure_fts_schema", spy_ensure)
+        db = SessionDB(db_path=db_path)
+        try:
+            assert ensure_trigram_calls == 0
+            assert db.get_meta("fts_trigram_projection_rebuild_pending") == "1"
+            assert db._trigram_available is False
+            live = db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_fts_trigram_%'"
+            ).fetchall()
+            assert live == []
+
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert db.get_meta("fts_trigram_projection_rebuild_pending") is None
+            assert db._trigram_available is True
+            live = db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_fts_trigram_%'"
+            ).fetchall()
+            assert len(live) == 3
+        finally:
+            db.close()
+
     def test_multimodal_fts_uses_text_projection(self, tmp_path):
         db_path = tmp_path / "state.db"
         db = SessionDB(db_path=db_path)
@@ -3097,11 +3278,27 @@ class TestFTSExternalContentMigration:
             with pytest.raises(RuntimeError, match="simulated crash"):
                 db.optimize_fts_storage(vacuum=False)
             assert db.get_meta("fts_trigram_projection_rebuild_pending") == "1"
+            db._conn.execute("DROP TRIGGER IF EXISTS messages_fts_update")
+            db._conn.execute(
+                "CREATE TRIGGER messages_fts_update AFTER UPDATE ON messages "
+                "BEGIN SELECT 1; END"
+            )
         finally:
             db.close()
 
+        ensure_trigram_calls = 0
+        original_ensure = SessionDB._ensure_fts_schema
+
+        def spy_ensure(session_db, cursor, table_name, ddl):
+            nonlocal ensure_trigram_calls
+            if table_name == "messages_fts_trigram":
+                ensure_trigram_calls += 1
+            return original_ensure(session_db, cursor, table_name, ddl)
+
+        monkeypatch.setattr(SessionDB, "_ensure_fts_schema", spy_ensure)
         db = SessionDB(db_path=db_path)
         try:
+            assert ensure_trigram_calls == 0
             assert db._trigram_available is False
             assert db._conn.execute(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "

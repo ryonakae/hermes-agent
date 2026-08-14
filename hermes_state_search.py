@@ -743,6 +743,12 @@ class SessionSearchMixin:
                 self._trigram_available = False
                 return False
 
+        trigram_triggers = tuple(
+            trigger
+            for trigger in _FTS_TRIGGERS
+            if trigger.startswith("messages_fts_trigram_")
+        )
+
         def _prepare(conn):
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, '1') "
@@ -750,9 +756,7 @@ class SessionSearchMixin:
                 (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
             )
             conn.execute("DELETE FROM state_meta WHERE key = 'fts_storage_version'")
-            for trigger in _FTS_TRIGGERS:
-                if trigger.startswith("messages_fts_trigram_"):
-                    conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            self._drop_named_fts_triggers(conn, trigram_triggers)
             conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
             self._backfill_fts_content(conn)
             return True
@@ -761,12 +765,6 @@ class SessionSearchMixin:
         with self._lock:
             self._conn.executescript(FTS_TRIGRAM_TABLE_SQL)
             self._trigram_available = False
-
-        trigram_triggers = tuple(
-            trigger
-            for trigger in _FTS_TRIGGERS
-            if trigger.startswith("messages_fts_trigram_")
-        )
 
         def _finalize(conn):
             # SessionDB connections use isolation_level=None.  _execute_write's
@@ -818,8 +816,7 @@ class SessionSearchMixin:
                 (FTS_CJK_PROJECTION_PENDING_KEY,),
             )
             conn.execute("DELETE FROM state_meta WHERE key = 'fts_storage_version'")
-            for trigger in _FTS_CJK_TRIGGERS:
-                conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            self._drop_named_fts_triggers(conn, _FTS_CJK_TRIGGERS)
             conn.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
             self._backfill_fts_content(conn)
             return True

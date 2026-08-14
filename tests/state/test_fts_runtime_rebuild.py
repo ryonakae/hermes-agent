@@ -19,6 +19,7 @@ import pytest
 
 from hermes_state import (
     FTS_STALE_KEY,
+    FTS_TRIGRAM_PROJECTION_PENDING_KEY,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
@@ -241,6 +242,56 @@ class TestRuntimeFtsRebuild:
         assert _message_contents(db_path)[-1] == "canonical survives"
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         assert _base_fts_triggers(db_path) == set()
+
+    def test_stale_base_recovery_does_not_restore_pending_trigram(
+        self, db, tmp_path, monkeypatch
+    ):
+        if not db._fts_enabled or not db._trigram_available:
+            pytest.skip("FTS5 trigram unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "pending trigram survives base recovery")
+        db.set_meta(FTS_STALE_KEY, "1", cursor=db._conn)
+        db.set_meta(
+            FTS_TRIGRAM_PROJECTION_PENDING_KEY, "1", cursor=db._conn
+        )
+        db._drop_fts_triggers(db._conn)
+        db.close()
+
+        trigram_probe_calls = 0
+        original_probe = SessionDB._fts_table_probe
+
+        def spy_probe(session_db, cursor, table_name):
+            nonlocal trigram_probe_calls
+            if table_name == "messages_fts_trigram":
+                trigram_probe_calls += 1
+            return original_probe(session_db, cursor, table_name)
+
+        monkeypatch.setattr(SessionDB, "_fts_table_probe", spy_probe)
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert trigram_probe_calls == 0
+            assert _meta_value(db_path, FTS_STALE_KEY) is None
+            assert _meta_value(
+                db_path, FTS_TRIGRAM_PROJECTION_PENDING_KEY
+            ) == "1"
+            assert reopened._fts_enabled is True
+            assert reopened._trigram_available is False
+            live = _base_fts_triggers(db_path)
+            assert {
+                name for name in live if name.startswith("messages_fts_trigram_")
+            } == set()
+            assert {
+                name for name in live if not name.startswith("messages_fts_trigram_")
+            } == {
+                "messages_fts_insert",
+                "messages_fts_delete",
+                "messages_fts_update",
+            }
+            reopened.append_message("s1", "user", "base stays writable")
+            assert reopened.search_messages("base stays writable")
+        finally:
+            reopened.close()
 
     def test_stale_search_preserves_not_semantics(self, db, tmp_path, monkeypatch):
         if not db._fts_enabled:

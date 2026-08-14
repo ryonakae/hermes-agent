@@ -68,6 +68,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     FTS_SQL,
     FTS_STALE_KEY,
     FTS_STORAGE_VERSION,
+    FTS_TRIGRAM_PROJECTION_PENDING_KEY,
     FTS_TRIGRAM_SQL,
     FTS_TRIGRAM_TABLE_SQL,
     FTS_TRIGRAM_TRIGGER_SQL,
@@ -3593,14 +3594,68 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:
         SessionDB._drop_named_fts_triggers(cursor, _FTS_TRIGGERS)
 
+    def _quarantine_incomplete_trigram_surface(
+        self, cursor: sqlite3.Cursor
+    ) -> bool:
+        """Detach residual trigram writers and record rebuild debt."""
+        trigram_triggers = tuple(
+            trigger
+            for trigger in _FTS_TRIGGERS
+            if trigger.startswith("messages_fts_trigram_")
+        )
+        placeholders = ",".join("?" for _ in trigram_triggers)
+        has_surface = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE "
+            "name = 'messages_fts_trigram' OR "
+            f"(type = 'trigger' AND name IN ({placeholders})) LIMIT 1",
+            trigram_triggers,
+        ).fetchone()
+        self._trigram_available = False
+        if not has_surface:
+            return False
+
+        # The existing vtable cannot be instantiated by this runtime, or
+        # residual writer triggers outlived it. Persist rebuild debt before
+        # verified cleanup so canonical messages remain writable and a future
+        # capable runtime cannot merely reinstall triggers over the index gap.
+        cursor.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'",
+            (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
+        )
+        self._drop_named_fts_triggers(cursor, trigram_triggers)
+        return True
+
     def _ensure_fts_schema(
         self,
         cursor: sqlite3.Cursor,
         table_name: str,
         ddl: str,
     ) -> bool:
+        if table_name == "messages_fts_trigram":
+            trigram_triggers = tuple(
+                trigger
+                for trigger in _FTS_TRIGGERS
+                if trigger.startswith("messages_fts_trigram_")
+            )
+            placeholders = ",".join("?" for _ in trigram_triggers)
+            table_exists = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone()
+            residual_trigger = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                f"AND name IN ({placeholders}) LIMIT 1",
+                trigram_triggers,
+            ).fetchone()
+            if not table_exists and residual_trigger:
+                self._quarantine_incomplete_trigram_surface(cursor)
+                return False
+
         status = self._fts_table_probe(cursor, table_name)
         if status is None:
+            if table_name == "messages_fts_trigram":
+                self._quarantine_incomplete_trigram_surface(cursor)
             return False
         try:
             # Run even when the virtual table exists so any dropped or missing
@@ -3616,6 +3671,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # particular table cannot be created — the base FTS5 table is fine.
             if self._is_trigram_unavailable_error(exc):
                 self._warn_trigram_unavailable(exc)
+                if table_name == "messages_fts_trigram":
+                    self._quarantine_incomplete_trigram_surface(cursor)
             else:
                 self._warn_fts5_unavailable(exc)
             return False
