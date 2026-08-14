@@ -120,12 +120,9 @@ class SessionSchemaMixin:
             return False
 
     def _drop_all_fts_triggers(self, cursor: sqlite3.Cursor) -> None:
-        self._drop_fts_triggers(cursor)
-        for trigger in _FTS_CJK_TRIGGERS:
-            try:
-                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-            except sqlite3.OperationalError:
-                pass
+        self._drop_named_fts_triggers(
+            cursor, (*_FTS_TRIGGERS, *_FTS_CJK_TRIGGERS)
+        )
 
     @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
@@ -851,10 +848,45 @@ class SessionSchemaMixin:
         if not fts5_available:
             # Existing FTS triggers can still fire on messages INSERT/UPDATE
             # even though the current sqlite runtime cannot read the virtual
-            # tables they target. Drop only the triggers so core persistence
-            # continues; if a future runtime has FTS5, _ensure_fts_schema()
-            # recreates them.
-            self._drop_fts_triggers(cursor)
+            # tables they target. Any canonical writes after trigger removal
+            # create an index gap, so persist rebuild breadcrumbs BEFORE the
+            # verified all-surface cleanup. A future capable runtime must
+            # rebuild rather than merely reinstalling triggers.
+            surfaces = {
+                row[0]
+                for row in cursor.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE name IN ('messages_fts', 'messages_fts_trigram', "
+                    "'messages_fts_cjk')"
+                ).fetchall()
+            }
+            live_triggers = {
+                row[0]
+                for row in cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    f"AND name IN ({','.join('?' for _ in (*_FTS_TRIGGERS, *_FTS_CJK_TRIGGERS))})",
+                    (*_FTS_TRIGGERS, *_FTS_CJK_TRIGGERS),
+                ).fetchall()
+            }
+            if surfaces or live_triggers:
+                cursor.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                    (FTS_STALE_KEY,),
+                )
+                self._fts_stale = True
+            if "messages_fts_cjk" in surfaces or any(
+                name in _FTS_CJK_TRIGGERS for name in live_triggers
+            ):
+                cursor.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                    (FTS_CJK_STALE_KEY,),
+                )
+            self._drop_all_fts_triggers(cursor)
+            self._fts_enabled = False
+            self._trigram_available = False
+            self._fts_cjk_available = False
 
         # ── Schema version bookkeeping ─────────────────────────────────
         # Bump to current so future data migrations (if any) can gate on

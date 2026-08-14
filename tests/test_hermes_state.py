@@ -70,6 +70,19 @@ class _NoTrigramConnection(sqlite3.Connection):
         return super().cursor(factory or _NoTrigramCursor)
 
 
+class _DropFailureCursor:
+    """Proxy a connection while refusing one trigger DROP."""
+
+    def __init__(self, conn, trigger):
+        self._conn = conn
+        self._trigger = trigger
+
+    def execute(self, sql, parameters=()):
+        if sql.strip() == f"DROP TRIGGER IF EXISTS {self._trigger}":
+            raise sqlite3.OperationalError("injected trigger drop failure")
+        return self._conn.execute(sql, parameters)
+
+
 @pytest.fixture()
 def db(tmp_path):
     """Create a SessionDB with a temp database file."""
@@ -5119,3 +5132,37 @@ class TestFts5SanitizerCharacterClass:
         # text; keep % intact there (pre-existing contract).
         sanitized = self._sanitize("完成50%")
         assert "%" in sanitized
+
+
+def test_fts5_unavailable_startup_quarantines_every_writer_trigger(db, monkeypatch):
+    db.create_session("s1", source="cli")
+    db.append_message("s1", role="user", content="existing indexed row")
+    before = {
+        row[0]
+        for row in db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_%'"
+        ).fetchall()
+    }
+    assert "messages_fts_insert" in before
+    if db._fts_cjk_loaded:
+        assert "messages_fts_cjk_insert" in before
+
+    monkeypatch.setattr(db, "_sqlite_supports_fts5", lambda cursor: False)
+    db._init_schema()
+
+    after = db._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+        "AND name LIKE 'messages_fts_%'"
+    ).fetchall()
+    assert after == []
+    assert db.get_meta("fts_stale") == "1"
+    if db._fts_cjk_loaded:
+        assert db.get_meta("fts_cjk_stale") == "1"
+
+
+def test_drop_all_fts_triggers_fails_closed_when_any_trigger_survives(db):
+    cursor = _DropFailureCursor(db._conn, "messages_fts_insert")
+
+    with pytest.raises(sqlite3.OperationalError, match="messages_fts_insert"):
+        db._drop_all_fts_triggers(cursor)

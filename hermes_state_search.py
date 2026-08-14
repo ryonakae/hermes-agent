@@ -1855,6 +1855,107 @@ class SessionSearchMixin:
             self._trigram_available = False
             self._fts_cjk_available = False
 
+    def _projection_search_availability(self) -> Tuple[bool, bool]:
+        """Return optional FTS routes after observing sibling-process debt."""
+
+        def _surface_ready(
+            conn: sqlite3.Connection,
+            table: str,
+            view: str,
+            expected_triggers: Tuple[str, ...],
+        ) -> bool:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            view_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = ?",
+                (view,),
+            ).fetchone()
+            if (
+                table_row is None
+                or view_row is None
+                or "fts_content" not in ((view_row[0] or "").lower())
+            ):
+                return False
+            live_triggers = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    f"AND name IN ({','.join('?' for _ in expected_triggers)})",
+                    expected_triggers,
+                ).fetchall()
+            }
+            if live_triggers != set(expected_triggers):
+                return False
+            try:
+                # MATCH forces SQLite to instantiate the vtable/tokenizer. A
+                # process that cannot load the tokenizer must keep using LIKE.
+                conn.execute(
+                    f"SELECT rowid FROM {table} WHERE {table} MATCH ? LIMIT 1",
+                    ("hermes_route_probe",),
+                ).fetchall()
+            except sqlite3.Error:
+                return False
+            return True
+
+        try:
+            with self._read_ctx() as conn:
+                rows = conn.execute(
+                    "SELECT key FROM state_meta WHERE key IN (?, ?, ?, ?)",
+                    (
+                        FTS_TRIGRAM_PROJECTION_PENDING_KEY,
+                        FTS_CJK_PROJECTION_PENDING_KEY,
+                        FTS_CJK_STALE_KEY,
+                        "fts_cjk_rebuild_high_water",
+                    ),
+                ).fetchall()
+                markers = {row[0] for row in rows}
+
+                trigram_blocked = FTS_TRIGRAM_PROJECTION_PENDING_KEY in markers
+                cjk_blocked = bool(
+                    markers.intersection(
+                        {
+                            FTS_CJK_PROJECTION_PENDING_KEY,
+                            FTS_CJK_STALE_KEY,
+                            "fts_cjk_rebuild_high_water",
+                        }
+                    )
+                )
+                trigram_available = not trigram_blocked and (
+                    self._trigram_available
+                    or _surface_ready(
+                        conn,
+                        "messages_fts_trigram",
+                        "messages_fts_trigram_src",
+                        tuple(
+                            trigger
+                            for trigger in _FTS_TRIGGERS
+                            if trigger.startswith("messages_fts_trigram_")
+                        ),
+                    )
+                )
+                cjk_available = not cjk_blocked and self._fts_cjk_loaded and (
+                    self._fts_cjk_available
+                    or _surface_ready(
+                        conn,
+                        "messages_fts_cjk",
+                        "messages_fts_cjk_src",
+                        _FTS_CJK_TRIGGERS,
+                    )
+                )
+        except sqlite3.Error:
+            # Optional indexes are an optimization. If quarantine state cannot
+            # be observed safely, use canonical-table LIKE rather than risk a
+            # stale cross-process availability flag.
+            return False, False
+
+        if trigram_available:
+            self._trigram_available = True
+        if cjk_available:
+            self._fts_cjk_available = True
+        return trigram_available, cjk_available
+
     def _finalize_search_matches(
         self,
         matches: List[Dict[str, Any]],
@@ -2011,6 +2112,10 @@ class SessionSearchMixin:
         if not self._fts_enabled:
             return []
 
+        trigram_search_available, cjk_search_available = (
+            self._projection_search_availability()
+        )
+
         # Normalise sort. Anything not in the allowed set falls back to None
         # (FTS5 rank-only) so callers can pass through user input without
         # validation.
@@ -2122,7 +2227,7 @@ class SessionSearchMixin:
             #     bigrams for runs >=2, so a single-char term can only match
             #     isolated chars — LIKE substring semantics are broader.
             if (
-                self._fts_cjk_available
+                cjk_search_available
                 and not _wants_tool_rows
                 and not self._has_lone_cjk_run(raw_query)
             ):
@@ -2209,7 +2314,7 @@ class SessionSearchMixin:
                 not _trigram_succeeded
                 and cjk_count >= 3
                 and not _any_short_cjk
-                and self._trigram_available
+                and trigram_search_available
                 and not _wants_tool_rows
             ):
                 # Trigram FTS5 path — quote each non-operator token to handle
@@ -2418,7 +2523,7 @@ class SessionSearchMixin:
             and not (bool(role_filter) and "tool" in role_filter)
         ):
             _fb_query = query.strip('"').strip()
-            if self._fts_cjk_available:
+            if cjk_search_available:
                 cjk_fb = self._run_trigram_search(
                     _fb_query,
                     table="messages_fts_cjk",
@@ -2434,7 +2539,7 @@ class SessionSearchMixin:
                     matches = cjk_fb
             if (
                 not matches
-                and self._trigram_available
+                and trigram_search_available
                 and self._trigram_eligible_tokens(query)
             ):
                 tri_matches = self._run_trigram_search(

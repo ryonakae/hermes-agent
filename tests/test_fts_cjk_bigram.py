@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from hermes_state import FTS_CJK_STALE_KEY, SessionDB
+from hermes_state import FTS_CJK_STALE_KEY, FTS_CJK_TRIGGER_SQL, SessionDB
+from hermes_state_common import FTS_TRIGRAM_TRIGGER_SQL
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "native" / "fts5_cjk" / "fts5_cjk.c"
@@ -548,3 +549,120 @@ def test_integrity_after_lifecycle(db):
             "INSERT INTO messages_fts_cjk(messages_fts_cjk) "
             "VALUES('integrity-check')"
         )
+
+
+def test_tokenizerless_cleanup_removes_cjk_triggers_without_cjk_table(db):
+    if not db._fts_cjk_loaded:
+        pytest.skip("CJK tokenizer extension unavailable")
+
+    with db._lock:
+        db._conn.execute("DROP TABLE messages_fts_cjk")
+        db._fts_cjk_loaded = False
+        live_before = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_cjk_%'"
+        ).fetchall()
+        assert live_before
+
+        db._ensure_fts_cjk_schema(db._conn)
+
+        live_after = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_cjk_%'"
+        ).fetchall()
+    assert live_after == []
+    assert db.get_meta("fts_cjk_stale") == "1"
+
+
+def test_existing_sessiondb_observes_projection_pending_from_sibling(db):
+    if not db._fts_cjk_loaded or not db._fts_cjk_available:
+        pytest.skip("CJK tokenizer extension unavailable")
+    db.create_session("cross-process", source="cli")
+    assert db._trigram_available is True
+
+    sibling = sqlite3.connect(db.db_path, isolation_level=None)
+    try:
+        sibling.execute("BEGIN IMMEDIATE")
+        for key in (
+            "fts_trigram_projection_rebuild_pending",
+            "fts_cjk_projection_rebuild_pending",
+        ):
+            sibling.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                (key,),
+            )
+        for trigger in (
+            "messages_fts_trigram_insert",
+            "messages_fts_trigram_delete",
+            "messages_fts_trigram_update",
+            "messages_fts_cjk_insert",
+            "messages_fts_cjk_delete",
+            "messages_fts_cjk_update",
+        ):
+            sibling.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        sibling.commit()
+    finally:
+        sibling.close()
+
+    message_id = db.append_message(
+        "cross-process", role="user", content="跨进程检索标记"
+    )
+    assert db._trigram_available is True
+    assert db._fts_cjk_available is True
+
+    hits = db.search_messages("跨进程检索标记")
+    assert message_id in {hit["id"] for hit in hits}
+
+
+def test_pending_open_restores_optional_routes_after_sibling_finalizes(db):
+    if not db._fts_cjk_loaded or not db._fts_cjk_available:
+        pytest.skip("CJK tokenizer extension unavailable")
+
+    sibling = sqlite3.connect(db.db_path, isolation_level=None)
+    try:
+        sibling.execute("BEGIN IMMEDIATE")
+        for key in (
+            "fts_trigram_projection_rebuild_pending",
+            "fts_cjk_projection_rebuild_pending",
+        ):
+            sibling.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                (key,),
+            )
+        for trigger in (
+            "messages_fts_trigram_insert",
+            "messages_fts_trigram_delete",
+            "messages_fts_trigram_update",
+            "messages_fts_cjk_insert",
+            "messages_fts_cjk_delete",
+            "messages_fts_cjk_update",
+        ):
+            sibling.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        sibling.commit()
+    finally:
+        sibling.close()
+
+    pending_reader = SessionDB(db_path=db.db_path)
+    try:
+        assert pending_reader._trigram_available is False
+        assert pending_reader._fts_cjk_available is False
+
+        sibling = sqlite3.connect(db.db_path, isolation_level=None)
+        try:
+            sibling.executescript(FTS_TRIGRAM_TRIGGER_SQL)
+            sibling.executescript(FTS_CJK_TRIGGER_SQL)
+            sibling.execute(
+                "DELETE FROM state_meta WHERE key IN "
+                "('fts_trigram_projection_rebuild_pending', "
+                "'fts_cjk_projection_rebuild_pending')"
+            )
+        finally:
+            sibling.close()
+
+        assert pending_reader._projection_search_availability() == (True, True)
+        assert pending_reader._trigram_available is True
+        assert pending_reader._fts_cjk_available is True
+    finally:
+        pending_reader.close()

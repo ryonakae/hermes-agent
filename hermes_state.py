@@ -3412,35 +3412,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "AND name = 'messages_fts_cjk'"
         ).fetchone())
 
+        live_cjk_triggers = [
+            row[0]
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
+                _FTS_CJK_TRIGGERS,
+            ).fetchall()
+        ]
+
         if not self._fts_cjk_loaded:
-            if cjk_present:
-                live = [
-                    r[0] for r in cursor.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
-                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
-                        _FTS_CJK_TRIGGERS,
-                    ).fetchall()
-                ]
-                if live:
-                    # Self-heal: this process cannot tokenize, so every
-                    # message INSERT would die inside the cjk trigger.
-                    # Breadcrumb FIRST (crash between the two statements is
-                    # merely conservative), then drop.
-                    logger.warning(
-                        "messages_fts_cjk triggers present but the "
-                        "cjk_unicode61 tokenizer is unavailable (%s) — "
-                        "dropping the cjk triggers so message writes keep "
-                        "working. CJK search falls back to trigram/LIKE; "
-                        "run `hermes sessions optimize-storage` on a host "
-                        "with the extension to rebuild.",
-                        fts5_cjk_so_path(),
-                    )
-                    cursor.execute(
-                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                        "ON CONFLICT(key) DO UPDATE SET value = '1'",
-                        (FTS_CJK_STALE_KEY,),
-                    )
-                    self._drop_fts_cjk_triggers(cursor)
+            if cjk_present or live_cjk_triggers:
+                # Self-heal: this process cannot tokenize. A table means new
+                # writes are about to create an index gap; residual triggers
+                # are even more urgent because SQLite permits their bodies to
+                # reference a missing virtual table and then fail at write time.
+                # Breadcrumb FIRST, then verified cleanup independent of table
+                # presence.
+                logger.warning(
+                    "messages_fts_cjk surface present but the cjk_unicode61 "
+                    "tokenizer is unavailable (%s) — quarantining CJK writer "
+                    "triggers. CJK search falls back to trigram/LIKE; run "
+                    "`hermes sessions optimize-storage` on a host with the "
+                    "extension to rebuild.",
+                    fts5_cjk_so_path(),
+                )
+                cursor.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                    (FTS_CJK_STALE_KEY,),
+                )
+                self._drop_fts_cjk_triggers(cursor)
             self._fts_cjk_available = False
             return
 
@@ -3557,13 +3559,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
     @staticmethod
-    def _drop_fts_cjk_triggers(cursor) -> None:
-        for trigger in _FTS_CJK_TRIGGERS:
+    def _drop_named_fts_triggers(cursor, triggers) -> None:
+        """Best-effort every DROP, then fail closed if any trigger survives."""
+        triggers = tuple(triggers)
+        for trigger in triggers:
             try:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             except sqlite3.OperationalError:
                 logger.warning(
-                    "Could not drop CJK FTS trigger %s; verifying quarantine",
+                    "Could not drop FTS trigger %s; verifying quarantine",
                     trigger,
                     exc_info=True,
                 )
@@ -3571,23 +3575,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row[0]
             for row in cursor.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'trigger' "
-                f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
-                _FTS_CJK_TRIGGERS,
+                f"AND name IN ({','.join('?' for _ in triggers)})",
+                triggers,
             ).fetchall()
         }
         if live:
             raise sqlite3.OperationalError(
-                "failed to quarantine CJK FTS triggers: "
+                "failed to quarantine FTS triggers: "
                 + ", ".join(sorted(live))
             )
 
     @staticmethod
+    def _drop_fts_cjk_triggers(cursor) -> None:
+        SessionDB._drop_named_fts_triggers(cursor, _FTS_CJK_TRIGGERS)
+
+    @staticmethod
     def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:
-        for trigger in _FTS_TRIGGERS:
-            try:
-                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-            except sqlite3.OperationalError:
-                pass
+        SessionDB._drop_named_fts_triggers(cursor, _FTS_TRIGGERS)
 
     def _ensure_fts_schema(
         self,
