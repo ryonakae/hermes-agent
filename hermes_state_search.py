@@ -18,11 +18,13 @@ from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
+    FTS_CJK_PROJECTION_PENDING_KEY,
     FTS_CJK_STALE_KEY,
     FTS_SQL,
     FTS_STALE_KEY,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
+    FTS_TRIGRAM_PROJECTION_PENDING_KEY,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
@@ -660,21 +662,35 @@ class SessionSearchMixin:
 
     def _fts_trigram_needs_multimodal_projection(self, cursor) -> bool:
         """True when an existing trigram view still indexes raw JSON blobs."""
+        pending = cursor.execute(
+            "SELECT 1 FROM state_meta WHERE key = ?",
+            (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
+        ).fetchone()
         return (
-            self._fts_storage_version(cursor) < FTS_STORAGE_VERSION
-            and not self._fts_view_uses_multimodal_projection(
-                cursor, "messages_fts_trigram_src"
+            pending is not None
+            or (
+                self._fts_storage_version(cursor) < FTS_STORAGE_VERSION
+                and not self._fts_view_uses_multimodal_projection(
+                    cursor, "messages_fts_trigram_src"
+                )
             )
         )
 
     def _fts_cjk_needs_multimodal_projection(self, cursor) -> bool:
         """True when a pre-projection CJK view needs an explicit rebuild."""
+        pending = cursor.execute(
+            "SELECT 1 FROM state_meta WHERE key = ?",
+            (FTS_CJK_PROJECTION_PENDING_KEY,),
+        ).fetchone()
         cjk_present = cursor.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'messages_fts_cjk'"
         ).fetchone()
-        return bool(cjk_present) and not self._fts_view_uses_multimodal_projection(
-            cursor, "messages_fts_cjk_src"
+        return pending is not None or (
+            bool(cjk_present)
+            and not self._fts_view_uses_multimodal_projection(
+                cursor, "messages_fts_cjk_src"
+            )
         )
 
     def _backfill_fts_content(self, conn) -> None:
@@ -689,13 +705,49 @@ class SessionSearchMixin:
                 [(self._fts_content(row[1]), row[0]) for row in batch],
             )
 
+    @staticmethod
+    def _trigram_tokenizer_is_loadable(conn) -> bool:
+        """Probe trigram DDL in TEMP without touching the durable index surface."""
+        probe = "__hermes_trigram_projection_probe"
+        try:
+            conn.execute(
+                f"CREATE VIRTUAL TABLE temp.{probe} "
+                "USING fts5(content, tokenize='trigram')"
+            )
+            return True
+        except sqlite3.DatabaseError as exc:
+            logger.warning(
+                "Trigram tokenizer capability probe failed; preserving the "
+                "existing index surface: %s",
+                exc,
+            )
+            return False
+        finally:
+            try:
+                conn.execute(f"DROP TABLE IF EXISTS temp.{probe}")
+            except sqlite3.DatabaseError:
+                pass
+
     def _upgrade_fts_trigram_projection(self) -> bool:
         """Rebuild the trigram index against the portable text projection."""
         with self._lock:
             if not self._fts_trigram_needs_multimodal_projection(self._conn):
                 return False
+            # An existing old trigram surface is still the user's best search
+            # path on a runtime that cannot load the tokenizer. Capability-probe
+            # fresh DDL in TEMP before touching any durable view or trigger; the
+            # startup availability flag alone may be stale for an existing table.
+            if not self._trigram_tokenizer_is_loadable(self._conn):
+                self._trigram_available = False
+                return False
 
         def _prepare(conn):
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
+            )
+            conn.execute("DELETE FROM state_meta WHERE key = 'fts_storage_version'")
             for trigger in _FTS_TRIGGERS:
                 if trigger.startswith("messages_fts_trigram_"):
                     conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
@@ -715,6 +767,10 @@ class SessionSearchMixin:
                 "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
                 "VALUES('rebuild')"
             )
+            self._conn.execute(
+                "DELETE FROM state_meta WHERE key = ?",
+                (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
+            )
             self._conn.commit()
             self._trigram_available = True
         return True
@@ -728,6 +784,12 @@ class SessionSearchMixin:
                 return False
 
         def _prepare(conn):
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                (FTS_CJK_PROJECTION_PENDING_KEY,),
+            )
+            conn.execute("DELETE FROM state_meta WHERE key = 'fts_storage_version'")
             for trigger in _FTS_CJK_TRIGGERS:
                 conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             conn.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
@@ -742,8 +804,8 @@ class SessionSearchMixin:
             )
             self._conn.execute(
                 "DELETE FROM state_meta WHERE key IN "
-                "('fts_cjk_rebuild_high_water', 'fts_cjk_rebuild_progress', ?)",
-                (FTS_CJK_STALE_KEY,),
+                "('fts_cjk_rebuild_high_water', 'fts_cjk_rebuild_progress', ?, ?)",
+                (FTS_CJK_STALE_KEY, FTS_CJK_PROJECTION_PENDING_KEY),
             )
             self._conn.commit()
             self._fts_cjk_available = True

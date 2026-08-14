@@ -2991,6 +2991,164 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
+    def test_projection_rebuild_crash_is_durable_and_resumable(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            message_id = db.append_message(
+                "s1",
+                role="user",
+                content=[
+                    {"type": "text", "text": "crash recovery marker"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,CRASH"},
+                    },
+                ],
+            )
+            conn = db._conn
+            for trigger in hermes_state._FTS_TRIGGERS:
+                if trigger.startswith("messages_fts_trigram_"):
+                    conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+            conn.execute("DROP TABLE messages_fts_trigram")
+            conn.execute(
+                "CREATE VIEW messages_fts_trigram_src AS "
+                "SELECT id, content, tool_name, tool_calls FROM messages "
+                "WHERE role <> 'tool'"
+            )
+            conn.execute(
+                "CREATE VIRTUAL TABLE messages_fts_trigram USING fts5("
+                "content, tool_name, tool_calls, "
+                "content='messages_fts_trigram_src', content_rowid='id', "
+                "tokenize='trigram')"
+            )
+            conn.execute(
+                "UPDATE messages SET fts_content = NULL WHERE id = ?",
+                (message_id,),
+            )
+            conn.execute(
+                "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+                "VALUES('rebuild')"
+            )
+            db.set_meta("fts_storage_version", "1", cursor=conn)
+            conn.commit()
+
+            original_ensure = db._ensure_fts_schema
+
+            def crash_after_schema(conn, table_name, sql):
+                result = original_ensure(conn, table_name, sql)
+                if table_name == "messages_fts_trigram":
+                    raise RuntimeError("simulated crash before trigram rebuild")
+                return result
+
+            monkeypatch.setattr(db, "_ensure_fts_schema", crash_after_schema)
+            with pytest.raises(RuntimeError, match="simulated crash"):
+                db.optimize_fts_storage(vacuum=False)
+            assert db.get_meta("fts_trigram_projection_rebuild_pending") == "1"
+        finally:
+            db.close()
+
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db.get_meta("fts_storage_version") != str(
+                hermes_state.FTS_STORAGE_VERSION
+            )
+            assert db.get_meta("fts_trigram_projection_rebuild_pending") == "1"
+            assert db.fts_optimize_available() is True
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert db.get_meta("fts_trigram_projection_rebuild_pending") is None
+            assert db.get_meta("fts_storage_version") == str(
+                hermes_state.FTS_STORAGE_VERSION
+            )
+            indexed = db._conn.execute(
+                "SELECT content FROM messages_fts_trigram WHERE rowid = ?",
+                (message_id,),
+            ).fetchone()[0]
+            assert indexed == "crash recovery marker"
+            assert "image_url" not in indexed
+        finally:
+            db.close()
+
+    def test_projection_upgrade_without_trigram_tokenizer_preserves_old_surface(
+        self, tmp_path, monkeypatch
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="legacy trigram marker")
+            conn = db._conn
+            for trigger in hermes_state._FTS_TRIGGERS:
+                if trigger.startswith("messages_fts_trigram_"):
+                    conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+            conn.execute("DROP TABLE messages_fts_trigram")
+            conn.execute(
+                "CREATE VIEW messages_fts_trigram_src AS "
+                "SELECT id, content, tool_name, tool_calls FROM messages "
+                "WHERE role <> 'tool'"
+            )
+            conn.execute(
+                "CREATE VIRTUAL TABLE messages_fts_trigram USING fts5("
+                "content, tool_name, tool_calls, "
+                "content='messages_fts_trigram_src', content_rowid='id', "
+                "tokenize='trigram')"
+            )
+            conn.execute(
+                "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+                "VALUES('rebuild')"
+            )
+            db.set_meta("fts_storage_version", "1", cursor=conn)
+            conn.commit()
+            old_view = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'view' AND name = 'messages_fts_trigram_src'"
+            ).fetchone()[0]
+            old_triggers = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name LIKE 'messages_fts_trigram_%'"
+                )
+            }
+            # Even if a stale startup flag says the existing vtable was readable,
+            # the destructive upgrade must capability-probe new trigram DDL first.
+            db._trigram_available = True
+            monkeypatch.setattr(
+                db,
+                "_trigram_tokenizer_is_loadable",
+                lambda _conn: False,
+                raising=False,
+            )
+
+            def unexpected_schema_rebuild(*_args, **_kwargs):
+                raise AssertionError("tokenizer-less upgrade touched trigram schema")
+
+            monkeypatch.setattr(db, "_ensure_fts_schema", unexpected_schema_rebuild)
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result == {
+                "ok": False,
+                "reason": "projection_incomplete",
+                "vacuumed": None,
+            }
+            assert conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'view' AND name = 'messages_fts_trigram_src'"
+            ).fetchone()[0] == old_view
+            assert {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name LIKE 'messages_fts_trigram_%'"
+                )
+            } == old_triggers
+            assert db.get_meta("fts_storage_version") == "1"
+            assert db.get_meta("fts_trigram_projection_rebuild_pending") is None
+        finally:
+            db.close()
+
     def _simulate_pre_fix_demote_crash_window(self, db):
         """Replay the pre-fix demote crash window: trash + empty v23 schema,
         no rebuild markers (executescript committed mid-demote before markers).

@@ -484,7 +484,9 @@ def _print_fts_optimize_available_notice() -> None:
             ).fetchone()
             or db._conn.execute(
                 "SELECT 1 FROM state_meta WHERE key IN "
-                "('fts_cjk_rebuild_high_water', 'fts_cjk_stale') LIMIT 1"
+                "('fts_cjk_rebuild_high_water', 'fts_cjk_stale', "
+                "'fts_trigram_projection_rebuild_pending', "
+                "'fts_cjk_projection_rebuild_pending') LIMIT 1"
             ).fetchone()
         )
         trigram_view = db._conn.execute(
@@ -493,6 +495,13 @@ def _print_fts_optimize_available_notice() -> None:
         ).fetchone()
         projection_pending = bool(
             trigram_view and "fts_content" not in ((trigram_view[0] or "").lower())
+        )
+        cjk_view = db._conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'view' AND name = 'messages_fts_cjk_src'"
+        ).fetchone()
+        projection_pending = projection_pending or bool(
+            cjk_view and "fts_content" not in ((cjk_view[0] or "").lower())
         )
     except Exception:
         return

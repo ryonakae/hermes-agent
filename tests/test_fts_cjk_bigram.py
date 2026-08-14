@@ -294,6 +294,73 @@ def test_old_cjk_view_rebuilds_with_multimodal_projection(db):
     assert "image_url" not in indexed
 
 
+def test_cjk_projection_rebuild_crash_is_durable_and_resumable(db, monkeypatch):
+    message_id = db.append_message(
+        "s1",
+        role="user",
+        content=[
+            {"type": "text", "text": "한국 crash marker"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,CJKCRASH"},
+            },
+        ],
+    )
+    with db._lock:
+        for trigger in (
+            "messages_fts_cjk_insert",
+            "messages_fts_cjk_delete",
+            "messages_fts_cjk_update",
+        ):
+            db._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        db._conn.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
+        db._conn.execute("DROP TABLE messages_fts_cjk")
+        db._conn.execute(
+            "CREATE VIEW messages_fts_cjk_src AS "
+            "SELECT id, content, tool_name, tool_calls FROM messages "
+            "WHERE role <> 'tool'"
+        )
+        db._conn.execute(
+            "CREATE VIRTUAL TABLE messages_fts_cjk USING fts5("
+            "content, tool_name, tool_calls, "
+            "content='messages_fts_cjk_src', content_rowid='id', "
+            "tokenize='cjk_unicode61')"
+        )
+        db._conn.execute(
+            "INSERT INTO messages_fts_cjk(messages_fts_cjk) VALUES('rebuild')"
+        )
+        db.set_meta("fts_storage_version", "1", cursor=db._conn)
+        db._conn.commit()
+
+    original_ensure = db._ensure_fts_cjk_schema
+    ensure_calls = 0
+
+    def crash_after_projection_schema(conn):
+        nonlocal ensure_calls
+        ensure_calls += 1
+        result = original_ensure(conn)
+        if ensure_calls == 2:
+            raise RuntimeError("simulated crash before CJK rebuild")
+        return result
+
+    monkeypatch.setattr(db, "_ensure_fts_cjk_schema", crash_after_projection_schema)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        db.optimize_fts_storage(vacuum=False)
+    assert db.get_meta("fts_cjk_projection_rebuild_pending") == "1"
+
+    monkeypatch.setattr(db, "_ensure_fts_cjk_schema", original_ensure)
+    assert db.get_meta("fts_storage_version") != "2"
+    assert db.fts_optimize_available() is True
+    result = db.optimize_fts_storage(vacuum=False)
+    assert result["ok"] is True
+    assert db.get_meta("fts_cjk_projection_rebuild_pending") is None
+    indexed = db._conn.execute(
+        "SELECT content FROM messages_fts_cjk WHERE rowid = ?", (message_id,)
+    ).fetchone()[0]
+    assert indexed == "한국 crash marker"
+    assert "image_url" not in indexed
+
+
 def test_integrity_after_lifecycle(db):
     db.append_message("s1", role="user", content="무결성 검사")
     with db._lock:

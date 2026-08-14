@@ -16,11 +16,13 @@ from typing import Dict, Optional
 from hermes_constants import get_hermes_home
 from hermes_state_common import (
     DEFERRED_INDEX_SQL,
+    FTS_CJK_PROJECTION_PENDING_KEY,
     FTS_CJK_STALE_KEY,
     FTS_STALE_KEY,
     FTS_SQL,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
+    FTS_TRIGRAM_PROJECTION_PENDING_KEY,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
@@ -1107,7 +1109,11 @@ class SessionSchemaMixin:
                 and not self._db_has_legacy_inline_fts(cursor)
                 and cursor.execute(
                     "SELECT 1 FROM state_meta "
-                    "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
+                    "WHERE key IN ('fts_rebuild_high_water', ?, ?) LIMIT 1",
+                    (
+                        FTS_TRIGRAM_PROJECTION_PENDING_KEY,
+                        FTS_CJK_PROJECTION_PENDING_KEY,
+                    ),
                 ).fetchone() is None
                 and not self._has_fts_trash(cursor)
                 and not self._fts_external_index_empty_with_messages(cursor)

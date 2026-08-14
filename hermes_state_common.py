@@ -231,6 +231,13 @@ SCHEMA_VERSION = 25
 #       the NUL JSON sentinel are excluded)
 FTS_STORAGE_VERSION = 2
 
+# Durable claims written before projection views/triggers are replaced and
+# cleared only in the same transaction as the corresponding FTS5 rebuild.
+# They make an interrupted optimize-storage run resumable even when the new
+# view definition is already visible on the next process start.
+FTS_TRIGRAM_PROJECTION_PENDING_KEY = "fts_trigram_projection_rebuild_pending"
+FTS_CJK_PROJECTION_PENDING_KEY = "fts_cjk_projection_rebuild_pending"
+
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
