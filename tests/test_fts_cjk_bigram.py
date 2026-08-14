@@ -306,6 +306,111 @@ def test_old_cjk_view_rebuilds_with_multimodal_projection(db):
     assert post_upgrade_id in matched_ids
 
 
+def test_cjk_projection_rebuild_keeps_pending_when_trigger_restore_fails(
+    db, monkeypatch
+):
+    import hermes_state
+
+    db.append_message("s1", role="user", content="한국 trigger failure marker")
+    with db._lock:
+        for trigger in (
+            "messages_fts_cjk_insert",
+            "messages_fts_cjk_delete",
+            "messages_fts_cjk_update",
+        ):
+            db._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        db._conn.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
+        db._conn.execute("DROP TABLE messages_fts_cjk")
+        db._conn.execute(
+            "CREATE VIEW messages_fts_cjk_src AS "
+            "SELECT id, content, tool_name, tool_calls FROM messages "
+            "WHERE role <> 'tool'"
+        )
+        db._conn.execute(
+            "CREATE VIRTUAL TABLE messages_fts_cjk USING fts5("
+            "content, tool_name, tool_calls, "
+            "content='messages_fts_cjk_src', content_rowid='id', "
+            "tokenize='cjk_unicode61')"
+        )
+        db._conn.execute(
+            "INSERT INTO messages_fts_cjk(messages_fts_cjk) VALUES('rebuild')"
+        )
+        db._conn.commit()
+
+    monkeypatch.setattr(
+        hermes_state,
+        "FTS_CJK_TRIGGER_SQL",
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_insert
+        AFTER INSERT ON messages BEGIN SELECT 1; END;
+        BROKEN SQL;
+        """,
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="restore CJK writer triggers"):
+        db.optimize_fts_storage(vacuum=False)
+
+    with db._lock:
+        pending = db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = "
+            "'fts_cjk_projection_rebuild_pending'"
+        ).fetchone()
+        triggers = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_cjk_%'"
+        ).fetchall()
+    assert pending is not None and pending[0] == "1"
+    assert triggers == []
+    assert db._fts_cjk_available is False
+
+
+def test_cjk_ensure_failure_durably_removes_partial_triggers(db, monkeypatch):
+    import hermes_state
+
+    with db._lock:
+        for trigger in (
+            "messages_fts_cjk_insert",
+            "messages_fts_cjk_delete",
+            "messages_fts_cjk_update",
+        ):
+            db._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        db._conn.execute(
+            "INSERT INTO state_meta (key, value) VALUES "
+            "('fts_cjk_projection_rebuild_pending', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'"
+        )
+        db._conn.commit()
+
+    monkeypatch.setattr(
+        hermes_state,
+        "FTS_CJK_TRIGGER_SQL",
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_insert
+        AFTER INSERT ON messages BEGIN SELECT 1; END;
+        BROKEN SQL;
+        """,
+    )
+
+    with db._lock:
+        db._ensure_fts_cjk_schema(db._conn)
+
+    observer = sqlite3.connect(db.db_path)
+    try:
+        triggers = observer.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_cjk_%'"
+        ).fetchall()
+        pending = observer.execute(
+            "SELECT value FROM state_meta WHERE key = "
+            "'fts_cjk_projection_rebuild_pending'"
+        ).fetchone()
+    finally:
+        observer.close()
+    assert triggers == []
+    assert pending == ("1",)
+    assert db._fts_cjk_available is False
+
+
 def test_cjk_projection_rebuild_crash_is_durable_and_resumable(db, monkeypatch):
     message_id = db.append_message(
         "s1",

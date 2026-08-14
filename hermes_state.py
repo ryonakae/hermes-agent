@@ -3497,19 +3497,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # The source view already uses fts_content, but the vtable may
                 # still contain raw pre-projection tokens. Updates/deletes must
                 # not feed projected delete terms into that mismatched index.
-                for trigger in _FTS_CJK_TRIGGERS:
-                    cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                self._drop_fts_cjk_triggers(cursor)
             self._fts_cjk_available = not (
                 backfill_pending or projection_pending
             )
         except sqlite3.OperationalError:
             # Includes "no such tokenizer: cjk_unicode61" if the extension
-            # loaded but registration failed — degrade to trigram/LIKE.
+            # loaded but registration failed — degrade to trigram/LIKE. An
+            # executescript failure may leave an earlier trigger committed;
+            # remove the whole writer surface so a pending projection rebuild
+            # cannot receive mismatched update/delete terms.
+            self._drop_fts_cjk_triggers(cursor)
             logger.warning(
                 "messages_fts_cjk ensure failed; CJK search stays on "
                 "trigram/LIKE", exc_info=True,
             )
             self._fts_cjk_available = False
+
+    @staticmethod
+    def _drop_fts_cjk_triggers(cursor) -> None:
+        for trigger in _FTS_CJK_TRIGGERS:
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            except sqlite3.OperationalError:
+                pass
 
     @staticmethod
     def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:

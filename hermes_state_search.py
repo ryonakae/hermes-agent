@@ -809,6 +809,20 @@ class SessionSearchMixin:
             self._ensure_fts_cjk_schema(
                 self._conn, allow_projection_pending_triggers=True
             )
+            live_triggers = {
+                row[0]
+                for row in self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
+                    _FTS_CJK_TRIGGERS,
+                ).fetchall()
+            }
+            if live_triggers != set(_FTS_CJK_TRIGGERS):
+                self._drop_fts_cjk_triggers(self._conn)
+                self._conn.commit()
+                raise sqlite3.OperationalError(
+                    "failed to restore CJK writer triggers after projection rebuild"
+                )
             self._conn.execute(
                 "DELETE FROM state_meta WHERE key IN "
                 "('fts_cjk_rebuild_high_water', 'fts_cjk_rebuild_progress', ?, ?)",
