@@ -235,6 +235,65 @@ def test_fresh_db_index_counts_exclude_tool_rows(db):
     assert idx == non_tool
 
 
+def test_old_cjk_view_rebuilds_with_multimodal_projection(db):
+    message_id = db.append_message(
+        "s1",
+        role="user",
+        content=[
+            {"type": "text", "text": "한국 projection marker"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,DDDD"},
+            },
+        ],
+    )
+    with db._lock:
+        for trigger in (
+            "messages_fts_cjk_insert",
+            "messages_fts_cjk_delete",
+            "messages_fts_cjk_update",
+        ):
+            db._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        db._conn.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
+        db._conn.execute("DROP TABLE messages_fts_cjk")
+        db._conn.execute(
+            "CREATE VIEW messages_fts_cjk_src AS "
+            "SELECT id, content, tool_name, tool_calls FROM messages "
+            "WHERE role <> 'tool'"
+        )
+        db._conn.execute(
+            "CREATE VIRTUAL TABLE messages_fts_cjk USING fts5("
+            "content, tool_name, tool_calls, "
+            "content='messages_fts_cjk_src', content_rowid='id', "
+            "tokenize='cjk_unicode61')"
+        )
+        db._conn.execute(
+            "INSERT INTO messages_fts_cjk(messages_fts_cjk) VALUES('rebuild')"
+        )
+        db._conn.commit()
+
+    assert db.fts_optimize_available() is True
+    result = db.optimize_fts_storage(vacuum=False)
+    assert result["ok"] is True
+    assert db.fts_optimize_available() is False
+    with db._lock:
+        view_sql = db._conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'view' AND name = 'messages_fts_cjk_src'"
+        ).fetchone()[0]
+        indexed = db._conn.execute(
+            "SELECT content FROM messages_fts_cjk WHERE rowid = ?",
+            (message_id,),
+        ).fetchone()[0]
+        db._conn.execute(
+            "INSERT INTO messages_fts_cjk(messages_fts_cjk) "
+            "VALUES('integrity-check')"
+        )
+    assert "fts_content" in view_sql
+    assert indexed == "한국 projection marker"
+    assert "image_url" not in indexed
+
+
 def test_integrity_after_lifecycle(db):
     db.append_message("s1", role="user", content="무결성 검사")
     with db._lock:

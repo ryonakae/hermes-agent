@@ -1112,7 +1112,10 @@ class SessionSchemaMixin:
                 and not self._has_fts_trash(cursor)
                 and not self._fts_external_index_empty_with_messages(cursor)
             ):
-                if self._fts_trigram_needs_multimodal_projection(cursor):
+                projection_pending = self._fts_trigram_needs_multimodal_projection(
+                    cursor
+                ) or self._fts_cjk_needs_multimodal_projection(cursor)
+                if projection_pending:
                     self.set_meta("fts_optimize_available", "1", cursor=cursor)
                 else:
                     self.set_meta(

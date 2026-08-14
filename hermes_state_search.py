@@ -1077,6 +1077,8 @@ class SessionSearchMixin:
                 return "backfill_incomplete"
             if self._fts_trigram_needs_multimodal_projection(conn):
                 return "projection_incomplete"
+            if self._fts_cjk_needs_multimodal_projection(conn):
+                return "projection_incomplete"
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES ('fts_storage_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",

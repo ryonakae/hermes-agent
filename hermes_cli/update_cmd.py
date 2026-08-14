@@ -422,11 +422,11 @@ def _print_curator_first_run_notice() -> None:
     )
 
 def _print_fts_optimize_available_notice() -> None:
-    """Advertise the opt-in v23 search-index optimization after `hermes update`.
+    """Advertise pending search-index storage work after `hermes update`.
 
-    Only fires when the current profile's state.db is still on the legacy
-    (pre-v23) inline FTS layout. Leads with the reclaimable-space figure and
-    points at the exact command. Honors ``sessions.fts_optimize_notice``:
+    Fires for the legacy inline layout, an interrupted rebuild, or an older
+    external-content substring index that still includes multimodal payloads.
+    Honors ``sessions.fts_optimize_notice``:
     ``advise`` (default) prints an advisory notice, ``require`` prints a
     firmer required-upgrade notice, ``off`` suppresses it. Silent for
     fresh/already-optimized installs.
@@ -462,6 +462,7 @@ def _print_fts_optimize_available_notice() -> None:
         return
     db = None
     interrupted = False
+    projection_pending = False
     try:
         db = SessionDB(db_path=db_path, read_only=True)
         # read_only opens skip schema init, so probe the layout directly.
@@ -486,6 +487,13 @@ def _print_fts_optimize_available_notice() -> None:
                 "('fts_cjk_rebuild_high_water', 'fts_cjk_stale') LIMIT 1"
             ).fetchone()
         )
+        trigram_view = db._conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'view' AND name = 'messages_fts_trigram_src'"
+        ).fetchone()
+        projection_pending = bool(
+            trigram_view and "fts_content" not in ((trigram_view[0] or "").lower())
+        )
     except Exception:
         return
     finally:
@@ -495,8 +503,10 @@ def _print_fts_optimize_available_notice() -> None:
             except Exception:
                 pass
     sql = (row[0] if row else "") or ""
-    if not sql or ("tool_name" in sql and not interrupted):
-        # v23 layout already present (fresh/optimized) — nothing to offer.
+    if not sql or (
+        "tool_name" in sql and not interrupted and not projection_pending
+    ):
+        # Current layout already present (fresh/optimized) — nothing to offer.
         return
 
     if interrupted:
@@ -508,6 +518,20 @@ def _print_fts_optimize_available_notice() -> None:
             "and finish reclaiming disk:"
         )
         print("    hermes sessions optimize-storage")
+        return
+
+    if projection_pending:
+        print()
+        print("◆ Session search index upgrade available")
+        print(
+            "  The substring index still includes multimodal image payloads. "
+            "Rebuild it as a portable text-only projection:"
+        )
+        print("    hermes sessions optimize-storage")
+        print(
+            "  The command is safe to interrupt/re-run and never changes "
+            "your conversations."
+        )
         return
 
     # Concrete size framing — lead with the savings the user cares about.

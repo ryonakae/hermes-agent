@@ -2864,6 +2864,60 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
+    def test_batch_insert_populates_multimodal_text_projection(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session(session_id="s1", source="cli")
+            inserted = db.append_messages_batch(
+                "s1",
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "batch marker"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,CCCC"},
+                            },
+                        ],
+                    }
+                ],
+            )
+            assert inserted == 1
+            row = db._conn.execute(
+                "SELECT id, content, fts_content FROM messages "
+                "WHERE session_id = 's1'"
+            ).fetchone()
+            assert row["content"].startswith("\x00json:")
+            assert row["fts_content"] == "batch marker"
+            indexed = db._conn.execute(
+                "SELECT content FROM messages_fts_trigram WHERE rowid = ?",
+                (row["id"],),
+            ).fetchone()[0]
+            assert indexed == "batch marker"
+        finally:
+            db.close()
+
+    def test_legacy_schema_reconciliation_adds_fts_content(self, tmp_path):
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("ALTER TABLE messages DROP COLUMN fts_content")
+            conn.commit()
+        finally:
+            conn.close()
+
+        db = SessionDB(db_path=db_path)
+        try:
+            columns = {
+                row[1] for row in db._conn.execute("PRAGMA table_info(messages)")
+            }
+            assert "fts_content" in columns
+            assert db.fts_optimize_available() is True
+        finally:
+            db.close()
+
     def test_optimize_rebuilds_pre_projection_trigram_index(self, tmp_path):
         db_path = tmp_path / "state.db"
         db = SessionDB(db_path=db_path)
