@@ -24,6 +24,8 @@ from hermes_state_common import (
     FTS_STALE_KEY,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
+    FTS_TRIGRAM_TABLE_SQL,
+    FTS_TRIGRAM_TRIGGER_SQL,
     FTS_TRIGRAM_PROJECTION_PENDING_KEY,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
@@ -757,21 +759,47 @@ class SessionSearchMixin:
 
         self._execute_write(_prepare)
         with self._lock:
-            if not self._ensure_fts_schema(
-                self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
-            ):
-                raise sqlite3.OperationalError(
-                    "failed to recreate projection-backed trigram FTS schema"
-                )
-            self._conn.execute(
+            self._conn.executescript(FTS_TRIGRAM_TABLE_SQL)
+            self._trigram_available = False
+
+        trigram_triggers = tuple(
+            trigger
+            for trigger in _FTS_TRIGGERS
+            if trigger.startswith("messages_fts_trigram_")
+        )
+
+        def _finalize(conn):
+            # SessionDB connections use isolation_level=None.  _execute_write's
+            # BEGIN IMMEDIATE is therefore the cross-process fence: the final
+            # rebuild catches every write from the triggerless preparation gap,
+            # and no sibling can write/drop triggers before marker deletion.
+            conn.execute(
                 "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
                 "VALUES('rebuild')"
             )
-            self._conn.execute(
+            self._execute_sql_script_transactionally(
+                conn, FTS_TRIGRAM_TRIGGER_SQL
+            )
+            live = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    f"AND name IN ({','.join('?' for _ in trigram_triggers)})",
+                    trigram_triggers,
+                ).fetchall()
+            }
+            if live != set(trigram_triggers):
+                raise sqlite3.OperationalError(
+                    "failed to restore trigram writer triggers after projection rebuild"
+                )
+            conn.execute(
                 "DELETE FROM state_meta WHERE key = ?",
                 (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
             )
-            self._conn.commit()
+            return True
+
+        self._execute_write(_finalize)
+        with self._lock:
             self._trigram_available = True
         return True
 
@@ -798,37 +826,32 @@ class SessionSearchMixin:
 
         self._execute_write(_prepare)
         with self._lock:
-            self._ensure_fts_cjk_schema(self._conn)
-            self._conn.execute(
+            self._ensure_fts_cjk_table_schema(self._conn)
+            self._fts_cjk_available = False
+
+        def _finalize(conn):
+            # Rebuild, trigger restoration, verification, and marker deletion
+            # share one BEGIN IMMEDIATE transaction.  Any DDL failure rolls the
+            # trigger set back to zero and leaves the previously committed
+            # projection marker as the durable quarantine.
+            conn.execute(
                 "INSERT INTO messages_fts_cjk(messages_fts_cjk) VALUES('rebuild')"
             )
-            # Restore synchronization before clearing the durable projection
-            # marker.  If trigger creation or the process fails here, startup
-            # still sees the marker and quarantines any partial trigger set.
-            # Once the marker is cleared, every future write must be covered.
-            self._ensure_fts_cjk_schema(
-                self._conn, allow_projection_pending_triggers=True
-            )
-            live_triggers = {
-                row[0]
-                for row in self._conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
-                    f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
-                    _FTS_CJK_TRIGGERS,
-                ).fetchall()
-            }
-            if live_triggers != set(_FTS_CJK_TRIGGERS):
-                self._drop_fts_cjk_triggers(self._conn)
-                self._conn.commit()
+            try:
+                self._create_fts_cjk_triggers_transactionally(conn)
+            except sqlite3.OperationalError as exc:
                 raise sqlite3.OperationalError(
                     "failed to restore CJK writer triggers after projection rebuild"
-                )
-            self._conn.execute(
+                ) from exc
+            conn.execute(
                 "DELETE FROM state_meta WHERE key IN "
                 "('fts_cjk_rebuild_high_water', 'fts_cjk_rebuild_progress', ?, ?)",
                 (FTS_CJK_STALE_KEY, FTS_CJK_PROJECTION_PENDING_KEY),
             )
-            self._conn.commit()
+            return True
+
+        self._execute_write(_finalize)
+        with self._lock:
             self._fts_cjk_available = True
         return True
 

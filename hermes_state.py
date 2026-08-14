@@ -69,6 +69,8 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     FTS_STALE_KEY,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
+    FTS_TRIGRAM_TABLE_SQL,
+    FTS_TRIGRAM_TRIGGER_SQL,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
     MAX_FTS5_QUERY_CHARS,
@@ -3386,9 +3388,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         ``cursor`` may be a Cursor or a Connection (both expose execute /
         executescript). Called only for v23-shape DBs with the base FTS
-        surface healthy. Sets ``self._fts_cjk_available``. Never raises;
-        every failure mode degrades to "no cjk index" (trigram/LIKE routing
-        keeps working).
+        surface healthy. Sets ``self._fts_cjk_available``. Schema failures
+        degrade to "no cjk index" (trigram/LIKE routing keeps working), unless
+        the writer triggers cannot be quarantined; that fail-closed case raises
+        rather than allowing writes through a partial trigger set.
 
         Cases:
           tokenizer loaded, table absent  → create. Empty DB: index is
@@ -3437,8 +3440,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "ON CONFLICT(key) DO UPDATE SET value = '1'",
                         (FTS_CJK_STALE_KEY,),
                     )
-                    for trig in live:
-                        cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+                    self._drop_fts_cjk_triggers(cursor)
             self._fts_cjk_available = False
             return
 
@@ -3482,6 +3484,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # Do NOT reinstall triggers (an external-content 'delete'
                 # for an unindexed rowid corrupts the index); the next
                 # `optimize-storage` run rebuilds from scratch.
+                self._drop_fts_cjk_triggers(cursor)
                 self._fts_cjk_available = False
                 return
             cursor.executescript(FTS_CJK_TRIGGER_SQL)
@@ -3507,6 +3510,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # executescript failure may leave an earlier trigger committed;
             # remove the whole writer surface so a pending projection rebuild
             # cannot receive mismatched update/delete terms.
+            cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                (FTS_CJK_STALE_KEY,),
+            )
             self._drop_fts_cjk_triggers(cursor)
             logger.warning(
                 "messages_fts_cjk ensure failed; CJK search stays on "
@@ -3515,12 +3523,63 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._fts_cjk_available = False
 
     @staticmethod
+    def _execute_sql_script_transactionally(cursor, ddl: str) -> None:
+        """Execute a DDL script without sqlite3.executescript autocommits."""
+        statement = ""
+        for line in ddl.splitlines(keepends=True):
+            statement += line
+            if sqlite3.complete_statement(statement):
+                sql = statement.strip()
+                if sql:
+                    cursor.execute(sql)
+                statement = ""
+        if statement.strip():
+            raise sqlite3.OperationalError("incomplete SQL statement in FTS DDL")
+
+    @staticmethod
+    def _ensure_fts_cjk_table_schema(cursor) -> None:
+        """Ensure only the CJK view/table, never its writer triggers."""
+        cursor.executescript(FTS_CJK_TABLE_SQL)
+
+    def _create_fts_cjk_triggers_transactionally(self, cursor) -> None:
+        self._execute_sql_script_transactionally(cursor, FTS_CJK_TRIGGER_SQL)
+        live = {
+            row[0]
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
+                _FTS_CJK_TRIGGERS,
+            ).fetchall()
+        }
+        if live != set(_FTS_CJK_TRIGGERS):
+            raise sqlite3.OperationalError(
+                "failed to restore CJK writer triggers after projection rebuild"
+            )
+
+    @staticmethod
     def _drop_fts_cjk_triggers(cursor) -> None:
         for trigger in _FTS_CJK_TRIGGERS:
             try:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             except sqlite3.OperationalError:
-                pass
+                logger.warning(
+                    "Could not drop CJK FTS trigger %s; verifying quarantine",
+                    trigger,
+                    exc_info=True,
+                )
+        live = {
+            row[0]
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
+                _FTS_CJK_TRIGGERS,
+            ).fetchall()
+        }
+        if live:
+            raise sqlite3.OperationalError(
+                "failed to quarantine CJK FTS triggers: "
+                + ", ".join(sorted(live))
+            )
 
     @staticmethod
     def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:

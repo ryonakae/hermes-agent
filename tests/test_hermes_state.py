@@ -2918,7 +2918,9 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
-    def test_optimize_rebuilds_pre_projection_trigram_index(self, tmp_path):
+    def test_optimize_rebuilds_pre_projection_trigram_index(
+        self, tmp_path, monkeypatch
+    ):
         db_path = tmp_path / "state.db"
         db = SessionDB(db_path=db_path)
         try:
@@ -2966,11 +2968,36 @@ class TestFTSExternalContentMigration:
 
         db = SessionDB(db_path=db_path)
         try:
+            original_execute_script = db._execute_sql_script_transactionally
+            lock_was_held = False
+
+            def probe_cross_process_fence(cursor, ddl):
+                nonlocal lock_was_held
+                if ddl == hermes_state.FTS_TRIGRAM_TRIGGER_SQL:
+                    observer = sqlite3.connect(db_path, timeout=0)
+                    try:
+                        with pytest.raises(sqlite3.OperationalError, match="locked"):
+                            observer.execute(
+                                "INSERT INTO messages "
+                                "(session_id, role, content, timestamp) VALUES "
+                                "('s1', 'user', 'should stay fenced', '2026-08-14')"
+                            )
+                        lock_was_held = True
+                    finally:
+                        observer.close()
+                original_execute_script(cursor, ddl)
+
+            monkeypatch.setattr(
+                db,
+                "_execute_sql_script_transactionally",
+                probe_cross_process_fence,
+            )
             assert db.get_meta("fts_storage_version") == "1"
             assert db.get_meta("fts_optimize_available") == "1"
             assert db.fts_optimize_available() is True
             result = db.optimize_fts_storage(vacuum=False)
             assert result["ok"] is True
+            assert lock_was_held is True
             assert db.get_meta("fts_storage_version") == str(
                 hermes_state.FTS_STORAGE_VERSION
             )
@@ -2988,6 +3015,14 @@ class TestFTSExternalContentMigration:
             ).fetchone()[0]
             assert db._conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
             assert db.fts_optimize_available() is False
+            post_upgrade_id = db.append_message(
+                "s1", role="user", content="trigram post upgrade sync marker"
+            )
+            assert db._conn.execute(
+                "SELECT rowid FROM messages_fts_trigram "
+                "WHERE messages_fts_trigram MATCH 'upgrade' AND rowid = ?",
+                (post_upgrade_id,),
+            ).fetchone() is not None
         finally:
             db.close()
 
@@ -3037,15 +3072,15 @@ class TestFTSExternalContentMigration:
             db.set_meta("fts_storage_version", "1", cursor=conn)
             conn.commit()
 
-            original_ensure = db._ensure_fts_schema
+            original_execute_write = db._execute_write
 
-            def crash_after_schema(conn, table_name, sql):
-                result = original_ensure(conn, table_name, sql)
-                if table_name == "messages_fts_trigram":
+            def crash_before_finalize(fn, *args, **kwargs):
+                result = original_execute_write(fn, *args, **kwargs)
+                if db.get_meta("fts_trigram_projection_rebuild_pending") == "1":
                     raise RuntimeError("simulated crash before trigram rebuild")
                 return result
 
-            monkeypatch.setattr(db, "_ensure_fts_schema", crash_after_schema)
+            monkeypatch.setattr(db, "_execute_write", crash_before_finalize)
             with pytest.raises(RuntimeError, match="simulated crash"):
                 db.optimize_fts_storage(vacuum=False)
             assert db.get_meta("fts_trigram_projection_rebuild_pending") == "1"

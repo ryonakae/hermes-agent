@@ -548,7 +548,7 @@ def _fts_index_content_sql(content: str, projection: str) -> str:
     )
 
 
-FTS_TRIGRAM_SQL = f"""
+FTS_TRIGRAM_TABLE_SQL = f"""
 CREATE VIEW IF NOT EXISTS messages_fts_trigram_src AS
     SELECT id, role, {_fts_index_content_sql('content', 'fts_content')} AS content, tool_name, tool_calls
     FROM messages
@@ -562,7 +562,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
     content_rowid='id',
     tokenize='trigram'
 );
+"""
 
+FTS_TRIGRAM_TRIGGER_SQL = f"""
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages
 WHEN new.role <> 'tool'
    AND (new.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
@@ -604,6 +606,8 @@ BEGIN
     WHERE new.role <> 'tool';
 END;
 """
+
+FTS_TRIGRAM_SQL = FTS_TRIGRAM_TABLE_SQL + FTS_TRIGRAM_TRIGGER_SQL
 
 
 _FTS_CJK_TRIGGERS = (

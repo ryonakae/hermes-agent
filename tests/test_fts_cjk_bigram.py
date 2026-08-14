@@ -235,7 +235,7 @@ def test_fresh_db_index_counts_exclude_tool_rows(db):
     assert idx == non_tool
 
 
-def test_old_cjk_view_rebuilds_with_multimodal_projection(db):
+def test_old_cjk_view_rebuilds_with_multimodal_projection(db, monkeypatch):
     message_id = db.append_message(
         "s1",
         role="user",
@@ -272,9 +272,33 @@ def test_old_cjk_view_rebuilds_with_multimodal_projection(db):
         )
         db._conn.commit()
 
+    original_create_triggers = db._create_fts_cjk_triggers_transactionally
+    lock_was_held = False
+
+    def probe_cross_process_fence(conn):
+        nonlocal lock_was_held
+        observer = sqlite3.connect(db.db_path, timeout=0)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                observer.execute(
+                    "INSERT INTO messages (session_id, role, content, timestamp) "
+                    "VALUES ('s1', 'user', 'should stay fenced', '2026-08-14')"
+                )
+            lock_was_held = True
+        finally:
+            observer.close()
+        original_create_triggers(conn)
+
+    monkeypatch.setattr(
+        db,
+        "_create_fts_cjk_triggers_transactionally",
+        probe_cross_process_fence,
+    )
+
     assert db.fts_optimize_available() is True
     result = db.optimize_fts_storage(vacuum=False)
     assert result["ok"] is True
+    assert lock_was_held is True
     assert db.fts_optimize_available() is False
     with db._lock:
         view_sql = db._conn.execute(
@@ -304,6 +328,22 @@ def test_old_cjk_view_rebuilds_with_multimodal_projection(db):
         ).fetchall()
     }
     assert post_upgrade_id in matched_ids
+
+    peer = SessionDB(db_path=db.db_path)
+    try:
+        peer_id = peer.append_message(
+            "s1", role="user", content="transaction 이후 peer 동기화"
+        )
+    finally:
+        peer.close()
+    peer_matched_ids = {
+        row[0]
+        for row in db._conn.execute(
+            "SELECT rowid FROM messages_fts_cjk "
+            "WHERE messages_fts_cjk MATCH '동기화'"
+        ).fetchall()
+    }
+    assert peer_id in peer_matched_ids
 
 
 def test_cjk_projection_rebuild_keeps_pending_when_trigger_restore_fails(
@@ -404,11 +444,27 @@ def test_cjk_ensure_failure_durably_removes_partial_triggers(db, monkeypatch):
             "SELECT value FROM state_meta WHERE key = "
             "'fts_cjk_projection_rebuild_pending'"
         ).fetchone()
+        stale = observer.execute(
+            "SELECT value FROM state_meta WHERE key = 'fts_cjk_stale'"
+        ).fetchone()
     finally:
         observer.close()
     assert triggers == []
     assert pending == ("1",)
+    assert stale == ("1",)
     assert db._fts_cjk_available is False
+
+    with db._lock:
+        db._conn.execute(
+            "CREATE TRIGGER messages_fts_cjk_insert "
+            "AFTER INSERT ON messages BEGIN SELECT 1; END"
+        )
+        db._ensure_fts_cjk_schema(db._conn)
+        triggers_after_stale_reopen = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_cjk_%'"
+        ).fetchall()
+    assert triggers_after_stale_reopen == []
 
 
 def test_cjk_projection_rebuild_crash_is_durable_and_resumable(db, monkeypatch):
@@ -449,23 +505,20 @@ def test_cjk_projection_rebuild_crash_is_durable_and_resumable(db, monkeypatch):
         db.set_meta("fts_storage_version", "1", cursor=db._conn)
         db._conn.commit()
 
-    original_ensure = db._ensure_fts_cjk_schema
-    ensure_calls = 0
+    original_execute_write = db._execute_write
 
-    def crash_after_projection_schema(conn):
-        nonlocal ensure_calls
-        ensure_calls += 1
-        result = original_ensure(conn)
-        if ensure_calls == 2:
+    def crash_before_finalize(fn, *args, **kwargs):
+        result = original_execute_write(fn, *args, **kwargs)
+        if db.get_meta("fts_cjk_projection_rebuild_pending") == "1":
             raise RuntimeError("simulated crash before CJK rebuild")
         return result
 
-    monkeypatch.setattr(db, "_ensure_fts_cjk_schema", crash_after_projection_schema)
+    monkeypatch.setattr(db, "_execute_write", crash_before_finalize)
     with pytest.raises(RuntimeError, match="simulated crash"):
         db.optimize_fts_storage(vacuum=False)
     assert db.get_meta("fts_cjk_projection_rebuild_pending") == "1"
 
-    monkeypatch.setattr(db, "_ensure_fts_cjk_schema", original_ensure)
+    monkeypatch.setattr(db, "_execute_write", original_execute_write)
     assert db.get_meta("fts_storage_version") != "2"
 
     # Startup/schema repair may reinstall synchronization triggers, but the
