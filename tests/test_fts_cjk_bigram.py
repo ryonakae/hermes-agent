@@ -350,6 +350,16 @@ def test_cjk_projection_rebuild_crash_is_durable_and_resumable(db, monkeypatch):
 
     monkeypatch.setattr(db, "_ensure_fts_cjk_schema", original_ensure)
     assert db.get_meta("fts_storage_version") != "2"
+
+    # Startup/schema repair may reinstall synchronization triggers, but the
+    # pre-rebuild index must stay out of search routing while debt is pending.
+    db._ensure_fts_cjk_schema(db._conn)
+    assert db._fts_cjk_available is False
+    assert db._conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+        "AND name LIKE 'messages_fts_cjk_%'"
+    ).fetchone()[0] == 0
+
     assert db.fts_optimize_available() is True
     result = db.optimize_fts_storage(vacuum=False)
     assert result["ok"] is True

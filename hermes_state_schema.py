@@ -1235,12 +1235,43 @@ class SessionSchemaMixin:
                     trigram_enabled = self._ensure_fts_schema(
                         cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
                     )
-                    self._trigram_available = trigram_enabled
+                    projection_pending = cursor.execute(
+                        "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                        (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
+                    ).fetchone()
+                    self._trigram_available = bool(
+                        trigram_enabled and not projection_pending
+                    )
+                    if projection_pending:
+                        # Rebuild debt means the existing vtable and current
+                        # projection view disagree. Keep it offline and detach
+                        # its writers until explicit optimize-storage rebuilds.
+                        for trigger in _FTS_TRIGGERS:
+                            if trigger.startswith("messages_fts_trigram_"):
+                                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
                     if triggers_need_repair:
-                        self._rebuild_fts_indexes(
-                            cursor,
-                            include_trigram=trigram_enabled,
-                        )
+                        if projection_pending:
+                            base_triggers = tuple(
+                                name
+                                for name in _FTS_TRIGGERS
+                                if not name.startswith("messages_fts_trigram_")
+                            )
+                            placeholders = ",".join("?" for _ in base_triggers)
+                            live_base = cursor.execute(
+                                "SELECT COUNT(*) FROM sqlite_master "
+                                "WHERE type = 'trigger' "
+                                f"AND name IN ({placeholders})",
+                                base_triggers,
+                            ).fetchone()[0]
+                            if live_base < len(base_triggers):
+                                self._rebuild_fts_indexes(
+                                    cursor, include_trigram=False
+                                )
+                        else:
+                            self._rebuild_fts_indexes(
+                                cursor,
+                                include_trigram=trigram_enabled,
+                            )
                     # CJK-bigram index (cjk_unicode61). Strictly additive to
                     # the surfaces above and gated on the loadable tokenizer:
                     self._ensure_fts_cjk_schema(cursor)

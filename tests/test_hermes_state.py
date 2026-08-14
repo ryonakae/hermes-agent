@@ -3054,6 +3054,11 @@ class TestFTSExternalContentMigration:
 
         db = SessionDB(db_path=db_path)
         try:
+            assert db._trigram_available is False
+            assert db._conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_fts_trigram_%'"
+            ).fetchone()[0] == 0
             assert db.get_meta("fts_storage_version") != str(
                 hermes_state.FTS_STORAGE_VERSION
             )

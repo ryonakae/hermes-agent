@@ -63,6 +63,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _sql_session_last_active_by_id,
     escape_like as _escape_like,
     DEFERRED_INDEX_SQL,
+    FTS_CJK_PROJECTION_PENDING_KEY,
     FTS_CJK_STALE_KEY,
     FTS_SQL,
     FTS_STALE_KEY,
@@ -3482,11 +3483,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._fts_cjk_available = False
                 return
             cursor.executescript(FTS_CJK_TRIGGER_SQL)
+            projection_pending = cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                (FTS_CJK_PROJECTION_PENDING_KEY,),
+            ).fetchone()
             backfill_pending = cursor.execute(
                 "SELECT 1 FROM state_meta "
                 "WHERE key = 'fts_cjk_rebuild_high_water' LIMIT 1"
             ).fetchone()
-            self._fts_cjk_available = not backfill_pending
+            if projection_pending:
+                # The source view already uses fts_content, but the vtable may
+                # still contain raw pre-projection tokens. Updates/deletes must
+                # not feed projected delete terms into that mismatched index.
+                for trigger in _FTS_CJK_TRIGGERS:
+                    cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            self._fts_cjk_available = not (
+                backfill_pending or projection_pending
+            )
         except sqlite3.OperationalError:
             # Includes "no such tokenizer: cjk_unicode61" if the extension
             # loaded but registration failed — degrade to trigram/LIKE.
