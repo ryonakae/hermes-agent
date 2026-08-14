@@ -3379,7 +3379,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             exc,
         )
 
-    def _ensure_fts_cjk_schema(self, cursor) -> None:
+    def _ensure_fts_cjk_schema(
+        self, cursor, *, allow_projection_pending_triggers: bool = False
+    ) -> None:
         """Create / repair / self-heal the CJK-bigram index surface.
 
         ``cursor`` may be a Cursor or a Connection (both expose execute /
@@ -3491,7 +3493,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "SELECT 1 FROM state_meta "
                 "WHERE key = 'fts_cjk_rebuild_high_water' LIMIT 1"
             ).fetchone()
-            if projection_pending:
+            if projection_pending and not allow_projection_pending_triggers:
                 # The source view already uses fts_content, but the vtable may
                 # still contain raw pre-projection tokens. Updates/deletes must
                 # not feed projected delete terms into that mismatched index.

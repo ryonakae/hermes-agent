@@ -802,6 +802,13 @@ class SessionSearchMixin:
             self._conn.execute(
                 "INSERT INTO messages_fts_cjk(messages_fts_cjk) VALUES('rebuild')"
             )
+            # Restore synchronization before clearing the durable projection
+            # marker.  If trigger creation or the process fails here, startup
+            # still sees the marker and quarantines any partial trigger set.
+            # Once the marker is cleared, every future write must be covered.
+            self._ensure_fts_cjk_schema(
+                self._conn, allow_projection_pending_triggers=True
+            )
             self._conn.execute(
                 "DELETE FROM state_meta WHERE key IN "
                 "('fts_cjk_rebuild_high_water', 'fts_cjk_rebuild_progress', ?, ?)",

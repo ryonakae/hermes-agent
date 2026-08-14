@@ -293,6 +293,18 @@ def test_old_cjk_view_rebuilds_with_multimodal_projection(db):
     assert indexed == "한국 projection marker"
     assert "image_url" not in indexed
 
+    post_upgrade_id = db.append_message(
+        "s1", role="user", content="업그레이드 후 동기화 marker"
+    )
+    matched_ids = {
+        row[0]
+        for row in db._conn.execute(
+            "SELECT rowid FROM messages_fts_cjk "
+            "WHERE messages_fts_cjk MATCH '동기화'"
+        ).fetchall()
+    }
+    assert post_upgrade_id in matched_ids
+
 
 def test_cjk_projection_rebuild_crash_is_durable_and_resumable(db, monkeypatch):
     message_id = db.append_message(
