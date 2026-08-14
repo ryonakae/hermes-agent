@@ -3637,6 +3637,48 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
+    def test_demote_with_pending_projection_skips_trigram_ensure(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "v22-pending.db"
+        self._build_v22_db(db_path)
+        db = SessionDB(db_path=db_path)
+        try:
+            db.set_meta("fts_trigram_projection_rebuild_pending", "1")
+            trigram_ensure_calls = 0
+            original_ensure = db._ensure_fts_schema
+
+            def spy_ensure(cursor, table_name, ddl):
+                nonlocal trigram_ensure_calls
+                if table_name == "messages_fts_trigram":
+                    trigram_ensure_calls += 1
+                return original_ensure(cursor, table_name, ddl)
+
+            monkeypatch.setattr(db, "_ensure_fts_schema", spy_ensure)
+            db._demote_legacy_fts_to_trash()
+            assert trigram_ensure_calls == 0
+            assert db.get_meta("fts_trigram_projection_rebuild_pending") == "1"
+            assert db._trigram_available is False
+            assert db._conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_fts_trigram_%'"
+            ).fetchone()[0] == 0
+
+            # Generic backfill resume may recreate the base surface, but the
+            # trigram surface stays quarantined until the fenced projection
+            # upgrade completes later in this explicit optimize call.
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert trigram_ensure_calls == 0
+            assert db.get_meta("fts_trigram_projection_rebuild_pending") is None
+            assert db._trigram_available is True
+            assert db._conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_fts_trigram_%'"
+            ).fetchone()[0] == 3
+        finally:
+            db.close()
+
     def test_demote_writes_markers_before_empty_schema(self, tmp_path):
         """Demote must commit rebuild markers before createscript builds the
         empty v23 tables — so a crash between stage and ensure still leaves

@@ -958,9 +958,22 @@ class SessionSearchMixin:
         # path above). Markers are already durable.
         with self._lock:
             base_ok = self._ensure_fts_schema(self._conn, "messages_fts", FTS_SQL)
-            trigram_ok = self._ensure_fts_schema(
-                self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
-            )
+            trigram_pending = self._conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
+            ).fetchone()
+            if trigram_pending:
+                trigram_triggers = tuple(
+                    name
+                    for name in _FTS_TRIGGERS
+                    if name.startswith("messages_fts_trigram_")
+                )
+                self._drop_named_fts_triggers(self._conn, trigram_triggers)
+                trigram_ok = False
+            else:
+                trigram_ok = self._ensure_fts_schema(
+                    self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                )
             self._trigram_available = bool(trigram_ok)
             if not base_ok:
                 raise sqlite3.OperationalError(
@@ -1015,9 +1028,24 @@ class SessionSearchMixin:
                 base_ok = self._ensure_fts_schema(
                     self._conn, "messages_fts", FTS_SQL
                 )
-                trigram_ok = self._ensure_fts_schema(
-                    self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                )
+                trigram_pending = self._conn.execute(
+                    "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                    (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
+                ).fetchone()
+                if trigram_pending:
+                    trigram_triggers = tuple(
+                        name
+                        for name in _FTS_TRIGGERS
+                        if name.startswith("messages_fts_trigram_")
+                    )
+                    self._drop_named_fts_triggers(
+                        self._conn, trigram_triggers
+                    )
+                    trigram_ok = False
+                else:
+                    trigram_ok = self._ensure_fts_schema(
+                        self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                    )
                 self._trigram_available = bool(trigram_ok)
                 if not base_ok:
                     # Fail fast: without the base table the backfill loop
