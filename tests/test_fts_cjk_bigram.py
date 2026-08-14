@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from hermes_state import FTS_CJK_STALE_KEY, SessionDB
+from hermes_state import FTS_CJK_STALE_KEY, FTS_CJK_TRIGGER_SQL, SessionDB
+from hermes_state_common import FTS_TRIGRAM_TRIGGER_SQL
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "native" / "fts5_cjk" / "fts5_cjk.c"
@@ -235,6 +236,312 @@ def test_fresh_db_index_counts_exclude_tool_rows(db):
     assert idx == non_tool
 
 
+def test_old_cjk_view_rebuilds_with_multimodal_projection(db, monkeypatch):
+    message_id = db.append_message(
+        "s1",
+        role="user",
+        content=[
+            {"type": "text", "text": "한국 projection marker"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,DDDD"},
+            },
+        ],
+    )
+    with db._lock:
+        for trigger in (
+            "messages_fts_cjk_insert",
+            "messages_fts_cjk_delete",
+            "messages_fts_cjk_update",
+        ):
+            db._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        db._conn.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
+        db._conn.execute("DROP TABLE messages_fts_cjk")
+        db._conn.execute(
+            "CREATE VIEW messages_fts_cjk_src AS "
+            "SELECT id, content, tool_name, tool_calls FROM messages "
+            "WHERE role <> 'tool'"
+        )
+        db._conn.execute(
+            "CREATE VIRTUAL TABLE messages_fts_cjk USING fts5("
+            "content, tool_name, tool_calls, "
+            "content='messages_fts_cjk_src', content_rowid='id', "
+            "tokenize='cjk_unicode61')"
+        )
+        db._conn.execute(
+            "INSERT INTO messages_fts_cjk(messages_fts_cjk) VALUES('rebuild')"
+        )
+        db._conn.commit()
+
+    original_create_triggers = db._create_fts_cjk_triggers_transactionally
+    lock_was_held = False
+
+    def probe_cross_process_fence(conn):
+        nonlocal lock_was_held
+        observer = sqlite3.connect(db.db_path, timeout=0)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                observer.execute(
+                    "INSERT INTO messages (session_id, role, content, timestamp) "
+                    "VALUES ('s1', 'user', 'should stay fenced', '2026-08-14')"
+                )
+            lock_was_held = True
+        finally:
+            observer.close()
+        original_create_triggers(conn)
+
+    monkeypatch.setattr(
+        db,
+        "_create_fts_cjk_triggers_transactionally",
+        probe_cross_process_fence,
+    )
+
+    assert db.fts_optimize_available() is True
+    result = db.optimize_fts_storage(vacuum=False)
+    assert result["ok"] is True
+    assert lock_was_held is True
+    assert db.fts_optimize_available() is False
+    with db._lock:
+        view_sql = db._conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'view' AND name = 'messages_fts_cjk_src'"
+        ).fetchone()[0]
+        indexed = db._conn.execute(
+            "SELECT content FROM messages_fts_cjk WHERE rowid = ?",
+            (message_id,),
+        ).fetchone()[0]
+        db._conn.execute(
+            "INSERT INTO messages_fts_cjk(messages_fts_cjk) "
+            "VALUES('integrity-check')"
+        )
+    assert "fts_content" in view_sql
+    assert indexed == "한국 projection marker"
+    assert "image_url" not in indexed
+
+    post_upgrade_id = db.append_message(
+        "s1", role="user", content="업그레이드 후 동기화 marker"
+    )
+    matched_ids = {
+        row[0]
+        for row in db._conn.execute(
+            "SELECT rowid FROM messages_fts_cjk "
+            "WHERE messages_fts_cjk MATCH '동기화'"
+        ).fetchall()
+    }
+    assert post_upgrade_id in matched_ids
+
+    peer = SessionDB(db_path=db.db_path)
+    try:
+        peer_id = peer.append_message(
+            "s1", role="user", content="transaction 이후 peer 동기화"
+        )
+    finally:
+        peer.close()
+    peer_matched_ids = {
+        row[0]
+        for row in db._conn.execute(
+            "SELECT rowid FROM messages_fts_cjk "
+            "WHERE messages_fts_cjk MATCH '동기화'"
+        ).fetchall()
+    }
+    assert peer_id in peer_matched_ids
+
+
+def test_cjk_projection_rebuild_keeps_pending_when_trigger_restore_fails(
+    db, monkeypatch
+):
+    import hermes_state
+
+    db.append_message("s1", role="user", content="한국 trigger failure marker")
+    with db._lock:
+        for trigger in (
+            "messages_fts_cjk_insert",
+            "messages_fts_cjk_delete",
+            "messages_fts_cjk_update",
+        ):
+            db._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        db._conn.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
+        db._conn.execute("DROP TABLE messages_fts_cjk")
+        db._conn.execute(
+            "CREATE VIEW messages_fts_cjk_src AS "
+            "SELECT id, content, tool_name, tool_calls FROM messages "
+            "WHERE role <> 'tool'"
+        )
+        db._conn.execute(
+            "CREATE VIRTUAL TABLE messages_fts_cjk USING fts5("
+            "content, tool_name, tool_calls, "
+            "content='messages_fts_cjk_src', content_rowid='id', "
+            "tokenize='cjk_unicode61')"
+        )
+        db._conn.execute(
+            "INSERT INTO messages_fts_cjk(messages_fts_cjk) VALUES('rebuild')"
+        )
+        db._conn.commit()
+
+    monkeypatch.setattr(
+        hermes_state,
+        "FTS_CJK_TRIGGER_SQL",
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_insert
+        AFTER INSERT ON messages BEGIN SELECT 1; END;
+        BROKEN SQL;
+        """,
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="restore CJK writer triggers"):
+        db.optimize_fts_storage(vacuum=False)
+
+    with db._lock:
+        pending = db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = "
+            "'fts_cjk_projection_rebuild_pending'"
+        ).fetchone()
+        triggers = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_cjk_%'"
+        ).fetchall()
+    assert pending is not None and pending[0] == "1"
+    assert triggers == []
+    assert db._fts_cjk_available is False
+
+
+def test_cjk_ensure_failure_durably_removes_partial_triggers(db, monkeypatch):
+    import hermes_state
+
+    with db._lock:
+        for trigger in (
+            "messages_fts_cjk_insert",
+            "messages_fts_cjk_delete",
+            "messages_fts_cjk_update",
+        ):
+            db._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        db._conn.execute(
+            "INSERT INTO state_meta (key, value) VALUES "
+            "('fts_cjk_projection_rebuild_pending', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'"
+        )
+        db._conn.commit()
+
+    monkeypatch.setattr(
+        hermes_state,
+        "FTS_CJK_TRIGGER_SQL",
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_insert
+        AFTER INSERT ON messages BEGIN SELECT 1; END;
+        BROKEN SQL;
+        """,
+    )
+
+    with db._lock:
+        db._ensure_fts_cjk_schema(db._conn)
+
+    observer = sqlite3.connect(db.db_path)
+    try:
+        triggers = observer.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_cjk_%'"
+        ).fetchall()
+        pending = observer.execute(
+            "SELECT value FROM state_meta WHERE key = "
+            "'fts_cjk_projection_rebuild_pending'"
+        ).fetchone()
+        stale = observer.execute(
+            "SELECT value FROM state_meta WHERE key = 'fts_cjk_stale'"
+        ).fetchone()
+    finally:
+        observer.close()
+    assert triggers == []
+    assert pending == ("1",)
+    assert stale == ("1",)
+    assert db._fts_cjk_available is False
+
+    with db._lock:
+        db._conn.execute(
+            "CREATE TRIGGER messages_fts_cjk_insert "
+            "AFTER INSERT ON messages BEGIN SELECT 1; END"
+        )
+        db._ensure_fts_cjk_schema(db._conn)
+        triggers_after_stale_reopen = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_cjk_%'"
+        ).fetchall()
+    assert triggers_after_stale_reopen == []
+
+
+def test_cjk_projection_rebuild_crash_is_durable_and_resumable(db, monkeypatch):
+    message_id = db.append_message(
+        "s1",
+        role="user",
+        content=[
+            {"type": "text", "text": "한국 crash marker"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,CJKCRASH"},
+            },
+        ],
+    )
+    with db._lock:
+        for trigger in (
+            "messages_fts_cjk_insert",
+            "messages_fts_cjk_delete",
+            "messages_fts_cjk_update",
+        ):
+            db._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        db._conn.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
+        db._conn.execute("DROP TABLE messages_fts_cjk")
+        db._conn.execute(
+            "CREATE VIEW messages_fts_cjk_src AS "
+            "SELECT id, content, tool_name, tool_calls FROM messages "
+            "WHERE role <> 'tool'"
+        )
+        db._conn.execute(
+            "CREATE VIRTUAL TABLE messages_fts_cjk USING fts5("
+            "content, tool_name, tool_calls, "
+            "content='messages_fts_cjk_src', content_rowid='id', "
+            "tokenize='cjk_unicode61')"
+        )
+        db._conn.execute(
+            "INSERT INTO messages_fts_cjk(messages_fts_cjk) VALUES('rebuild')"
+        )
+        db.set_meta("fts_storage_version", "1", cursor=db._conn)
+        db._conn.commit()
+
+    original_execute_write = db._execute_write
+
+    def crash_before_finalize(fn, *args, **kwargs):
+        result = original_execute_write(fn, *args, **kwargs)
+        if db.get_meta("fts_cjk_projection_rebuild_pending") == "1":
+            raise RuntimeError("simulated crash before CJK rebuild")
+        return result
+
+    monkeypatch.setattr(db, "_execute_write", crash_before_finalize)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        db.optimize_fts_storage(vacuum=False)
+    assert db.get_meta("fts_cjk_projection_rebuild_pending") == "1"
+
+    monkeypatch.setattr(db, "_execute_write", original_execute_write)
+    assert db.get_meta("fts_storage_version") != "2"
+
+    # Startup/schema repair may reinstall synchronization triggers, but the
+    # pre-rebuild index must stay out of search routing while debt is pending.
+    db._ensure_fts_cjk_schema(db._conn)
+    assert db._fts_cjk_available is False
+    assert db._conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+        "AND name LIKE 'messages_fts_cjk_%'"
+    ).fetchone()[0] == 0
+
+    assert db.fts_optimize_available() is True
+    result = db.optimize_fts_storage(vacuum=False)
+    assert result["ok"] is True
+    assert db.get_meta("fts_cjk_projection_rebuild_pending") is None
+    indexed = db._conn.execute(
+        "SELECT content FROM messages_fts_cjk WHERE rowid = ?", (message_id,)
+    ).fetchone()[0]
+    assert indexed == "한국 crash marker"
+    assert "image_url" not in indexed
+
+
 def test_integrity_after_lifecycle(db):
     db.append_message("s1", role="user", content="무결성 검사")
     with db._lock:
@@ -242,3 +549,120 @@ def test_integrity_after_lifecycle(db):
             "INSERT INTO messages_fts_cjk(messages_fts_cjk) "
             "VALUES('integrity-check')"
         )
+
+
+def test_tokenizerless_cleanup_removes_cjk_triggers_without_cjk_table(db):
+    if not db._fts_cjk_loaded:
+        pytest.skip("CJK tokenizer extension unavailable")
+
+    with db._lock:
+        db._conn.execute("DROP TABLE messages_fts_cjk")
+        db._fts_cjk_loaded = False
+        live_before = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_cjk_%'"
+        ).fetchall()
+        assert live_before
+
+        db._ensure_fts_cjk_schema(db._conn)
+
+        live_after = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_cjk_%'"
+        ).fetchall()
+    assert live_after == []
+    assert db.get_meta("fts_cjk_stale") == "1"
+
+
+def test_existing_sessiondb_observes_projection_pending_from_sibling(db):
+    if not db._fts_cjk_loaded or not db._fts_cjk_available:
+        pytest.skip("CJK tokenizer extension unavailable")
+    db.create_session("cross-process", source="cli")
+    assert db._trigram_available is True
+
+    sibling = sqlite3.connect(db.db_path, isolation_level=None)
+    try:
+        sibling.execute("BEGIN IMMEDIATE")
+        for key in (
+            "fts_trigram_projection_rebuild_pending",
+            "fts_cjk_projection_rebuild_pending",
+        ):
+            sibling.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                (key,),
+            )
+        for trigger in (
+            "messages_fts_trigram_insert",
+            "messages_fts_trigram_delete",
+            "messages_fts_trigram_update",
+            "messages_fts_cjk_insert",
+            "messages_fts_cjk_delete",
+            "messages_fts_cjk_update",
+        ):
+            sibling.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        sibling.commit()
+    finally:
+        sibling.close()
+
+    message_id = db.append_message(
+        "cross-process", role="user", content="跨进程检索标记"
+    )
+    assert db._trigram_available is True
+    assert db._fts_cjk_available is True
+
+    hits = db.search_messages("跨进程检索标记")
+    assert message_id in {hit["id"] for hit in hits}
+
+
+def test_pending_open_restores_optional_routes_after_sibling_finalizes(db):
+    if not db._fts_cjk_loaded or not db._fts_cjk_available:
+        pytest.skip("CJK tokenizer extension unavailable")
+
+    sibling = sqlite3.connect(db.db_path, isolation_level=None)
+    try:
+        sibling.execute("BEGIN IMMEDIATE")
+        for key in (
+            "fts_trigram_projection_rebuild_pending",
+            "fts_cjk_projection_rebuild_pending",
+        ):
+            sibling.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                (key,),
+            )
+        for trigger in (
+            "messages_fts_trigram_insert",
+            "messages_fts_trigram_delete",
+            "messages_fts_trigram_update",
+            "messages_fts_cjk_insert",
+            "messages_fts_cjk_delete",
+            "messages_fts_cjk_update",
+        ):
+            sibling.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        sibling.commit()
+    finally:
+        sibling.close()
+
+    pending_reader = SessionDB(db_path=db.db_path)
+    try:
+        assert pending_reader._trigram_available is False
+        assert pending_reader._fts_cjk_available is False
+
+        sibling = sqlite3.connect(db.db_path, isolation_level=None)
+        try:
+            sibling.executescript(FTS_TRIGRAM_TRIGGER_SQL)
+            sibling.executescript(FTS_CJK_TRIGGER_SQL)
+            sibling.execute(
+                "DELETE FROM state_meta WHERE key IN "
+                "('fts_trigram_projection_rebuild_pending', "
+                "'fts_cjk_projection_rebuild_pending')"
+            )
+        finally:
+            sibling.close()
+
+        assert pending_reader._projection_search_availability() == (True, True)
+        assert pending_reader._trigram_available is True
+        assert pending_reader._fts_cjk_available is True
+    finally:
+        pending_reader.close()

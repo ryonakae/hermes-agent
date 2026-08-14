@@ -34,6 +34,18 @@ _PREVIEW_SCAFFOLD_WINDOW = 400
 _PREVIEW_MAX_CHARS = 60
 
 
+def escape_like(text: str) -> str:
+    """Escape SQL LIKE wildcards so operator/session-derived text matches
+    literally.  Pair with ``ESCAPE '\\'`` in the clause.
+
+    ``%`` and ``_`` are wildcards to LIKE, and ``_`` in particular is common
+    in the values these patterns run against (branch names, session titles,
+    filesystem paths).  A match documented as substring/prefix must not
+    silently widen.
+    """
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 _PREVIEW_CONTENT_SQL = "REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' ')"
 
 
@@ -86,19 +98,71 @@ _COMPRESSION_CHILD_SQL = (
 )
 
 
-# Rows that surface in pickers: roots + branch children (subagent runs and
-# compression continuations stay hidden).
-_LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
+_RESET_END_REASONS = (
+    "session_reset",
+    # switch_session() never creates a child row, but pre-marker DBs can hold
+    # legacy reset children whose parent later ended with 'session_switch'
+    # (resumed then switched away before reopen-time stamping existed). Also
+    # keeps this set identical to the recovery fence in
+    # find_latest_gateway_session_for_peer, which interpolates
+    # _RESET_END_REASONS_SQL so the two cannot drift.
+    "session_switch",
+    "idle",
+    "daily",
+    "suspended",
+    "resume_pending_expired",
+)
+_RESET_END_REASONS_SQL = ", ".join(f"'{reason}'" for reason in _RESET_END_REASONS)
+
+
+def _legacy_reset_child_sql(alias: str, reasons_sql: str) -> str:
+    """Pre-marker reset-continuation heuristic.
+
+    A child is a legacy reset continuation when it rides its parent's exact
+    non-empty routing key and the parent ended at a reset boundary. Shared by
+    the listing predicate (``_RESET_CHILD_SQL``) and ``reopen_session()``'s
+    marker-stamping UPDATE so the two sites cannot drift; ``reasons_sql`` is
+    either the literal ``_RESET_END_REASONS_SQL`` or a bound-placeholder list.
+    """
+    return (
+        f"EXISTS (SELECT 1 FROM sessions p"
+        f"            WHERE p.id = {alias}.parent_session_id"
+        f"            AND p.end_reason IN ({reasons_sql})"
+        f"            AND {alias}.session_key IS NOT NULL"
+        f"            AND {alias}.session_key != ''"
+        f"            AND {alias}.session_key = p.session_key)"
+    )
+
+
+# A reset starts a separate user-visible conversation even though gateway rows
+# retain parent_session_id for durable lineage. New rows carry the stable
+# marker; the same-key fallback recovers rows written before the marker existed.
+# Requiring the exact non-empty routing key keeps ordinary child/subagent rows
+# out even when their parent is later reset.
+_RESET_CHILD_SQL = (
+    "json_extract(COALESCE({a}.model_config, '{{}}'), '$._reset_from') IS NOT NULL"
+    " OR " + _legacy_reset_child_sql("{a}", _RESET_END_REASONS_SQL)
+)
+
+
+# Rows that surface in pickers: roots + branch/reset children. Subagent runs
+# and compression continuations stay hidden.
+_LISTABLE_CHILD_SQL = (
+    f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')}"
+    f" OR {_RESET_CHILD_SQL.format(a='s')})"
+)
 
 
 def _ephemeral_child_sql(alias: str = "s") -> str:
-    """Subagent runs (cascade-delete targets), not branches or compression tips."""
+    """Subagent runs, not branch, reset, or compression children."""
     branch = _BRANCH_CHILD_SQL.format(a=alias)
     compression = _COMPRESSION_CHILD_SQL.format(a=alias)
+    reset = _RESET_CHILD_SQL.format(a=alias)
     return (
         f"({alias}.parent_session_id IS NOT NULL"
         f" AND NOT ({branch})"
-        f" AND NOT ({compression}))"
+        f" AND NOT ({compression})"
+        f" AND NOT ({reset}))"
     )
 
 
@@ -163,7 +227,16 @@ SCHEMA_VERSION = 25
 # layout 0 (marker absent) with a working inline index until the user opts in.
 #   1 = v23 external-content layout (content/tool_name/tool_calls,
 #       tool-row-excluded trigram)
-FTS_STORAGE_VERSION = 1
+#   2 = multimodal text projection for substring indexes (image payloads and
+#       the NUL JSON sentinel are excluded)
+FTS_STORAGE_VERSION = 2
+
+# Durable claims written before projection views/triggers are replaced and
+# cleared only in the same transaction as the corresponding FTS5 rebuild.
+# They make an interrupted optimize-storage run resumable even when the new
+# view definition is already visible on the next process start.
+FTS_TRIGRAM_PROJECTION_PENDING_KEY = "fts_trigram_projection_rebuild_pending"
+FTS_CJK_PROJECTION_PENDING_KEY = "fts_cjk_projection_rebuild_pending"
 
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
@@ -230,6 +303,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    title_source TEXT,
     last_activity_at REAL,
     last_activity_description TEXT,
     last_activity_provenance TEXT,
@@ -245,6 +319,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
+    last_read_at REAL,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
@@ -254,6 +329,7 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL REFERENCES sessions(id),
     role TEXT NOT NULL,
     content TEXT,
+    fts_content TEXT,
     tool_call_id TEXT,
     tool_calls TEXT,
     tool_name TEXT,
@@ -458,14 +534,23 @@ END;
 # of the text it covers), and ``role='tool'`` rows are ~90% of message bytes
 # while being almost entirely machine noise (base64 payloads, file dumps,
 # delegation transcripts).  The index therefore reads through
-# ``messages_fts_trigram_src``, a view that excludes tool rows — they stay
+# ``messages_fts_trigram_src``, a view that excludes tool rows and reads their
+# SessionDB-maintained multimodal text projection — they stay
 # fully stored in ``messages`` and fully searchable via the standard
 # ``messages_fts`` index; they just don't get trigram (CJK substring)
 # treatment.  ``search_messages`` routes CJK queries that filter on
 # ``role='tool'`` to the LIKE fallback for the same reason.
-FTS_TRIGRAM_SQL = """
+def _fts_index_content_sql(content: str, projection: str) -> str:
+    """Return the FTS value for a trusted pair of message column expressions."""
+    return (
+        f"CASE WHEN substr(CAST({content} AS BLOB), 1, 6) = X'006A736F6E3A' "
+        f"THEN COALESCE({projection}, '') ELSE {content} END"
+    )
+
+
+FTS_TRIGRAM_TABLE_SQL = f"""
 CREATE VIEW IF NOT EXISTS messages_fts_trigram_src AS
-    SELECT id, role, content, tool_name, tool_calls
+    SELECT id, role, {_fts_index_content_sql('content', 'fts_content')} AS content, tool_name, tool_calls
     FROM messages
     WHERE role <> 'tool';
 
@@ -477,7 +562,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
     content_rowid='id',
     tokenize='trigram'
 );
+"""
 
+FTS_TRIGRAM_TRIGGER_SQL = f"""
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages
 WHEN new.role <> 'tool'
    AND (new.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
@@ -486,7 +573,7 @@ WHEN new.role <> 'tool'
                             WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls)
-    VALUES (new.id, new.content, new.tool_name, new.tool_calls);
+    VALUES (new.id, {_fts_index_content_sql('new.content', 'new.fts_content')}, new.tool_name, new.tool_calls);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages
@@ -497,7 +584,7 @@ WHEN old.role <> 'tool'
                             WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name, tool_calls)
-    VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
+    VALUES ('delete', old.id, {_fts_index_content_sql('old.content', 'old.fts_content')}, old.tool_name, old.tool_calls);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update
@@ -512,13 +599,15 @@ WHEN (old.content IS NOT new.content
                             WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name, tool_calls)
-    SELECT 'delete', old.id, old.content, old.tool_name, old.tool_calls
+    SELECT 'delete', old.id, {_fts_index_content_sql('old.content', 'old.fts_content')}, old.tool_name, old.tool_calls
     WHERE old.role <> 'tool';
     INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls)
-    SELECT new.id, new.content, new.tool_name, new.tool_calls
+    SELECT new.id, {_fts_index_content_sql('new.content', 'new.fts_content')}, new.tool_name, new.tool_calls
     WHERE new.role <> 'tool';
 END;
 """
+
+FTS_TRIGRAM_SQL = FTS_TRIGRAM_TABLE_SQL + FTS_TRIGRAM_TRIGGER_SQL
 
 
 _FTS_CJK_TRIGGERS = (
@@ -533,6 +622,14 @@ _FTS_CJK_TRIGGERS = (
 # on are missing from the cjk index, so it must not serve reads until
 # `hermes sessions optimize-storage` rebuilds it on a capable host.
 FTS_CJK_STALE_KEY = "fts_cjk_stale"
+
+
+# Durable breadcrumb for a base/trigram FTS index that was detached from the
+# canonical messages table after runtime corruption. While present, startup
+# must rebuild the complete index before reinstalling sync triggers: rows may
+# have been written while those triggers were absent, so merely recreating
+# them would preserve an unknown index gap.
+FTS_STALE_KEY = "fts_stale"
 
 
 # ── Legacy (v22 / inline-content) FTS DDL ──────────────────────────────
