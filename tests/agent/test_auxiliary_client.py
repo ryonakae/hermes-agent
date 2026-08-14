@@ -2058,7 +2058,28 @@ class TestTransientTransportRetry:
             ),
         )
 
+    def test_retries_statusless_overload_on_same_provider(self):
+        overload = Exception("Our servers are currently overloaded. Please try again later.")
+        success = {"status": "completed"}
+        client = MagicMock()
+        client.base_url = "https://openrouter.ai/api/v1"
+        client.chat.completions.create.side_effect = [overload, success]
+        p1, p2, p3 = self._patches(client)
 
+        with (
+            p1,
+            p2,
+            p3,
+            patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0),
+            patch("agent.auxiliary_client._transient_retry_count", return_value=2),
+        ):
+            result = call_llm(
+                task="hermes_trading_role",
+                messages=[{"role": "user", "content": "analyze"}],
+            )
+
+        assert result == success
+        assert client.chat.completions.create.call_count == 2
 
     def test_does_not_retry_non_transient_400(self):
         class _Err400(Exception):

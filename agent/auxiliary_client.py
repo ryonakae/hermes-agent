@@ -3873,9 +3873,10 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     same provider before any provider/model fallback.
 
     Covers connection/streaming-close errors (via the canonical
-    ``_is_connection_error`` detector, shared so the two cannot drift) plus a
-    pure 5xx/408 HTTP status. Deliberately narrow: this is the "retry the
-    same target once" gate, distinct from ``_is_payment_error`` /
+    ``_is_connection_error`` detector, shared so the two cannot drift), a pure
+    5xx/408 HTTP status, and status-less provider overload errors recognized by
+    the shared API error classifier. Deliberately narrow: this is the "retry
+    the same target" gate, distinct from ``_is_payment_error`` /
     ``_is_auth_error`` / ``_is_rate_limit_error`` which the except-chain
     handles by switching provider, refreshing creds, or rotating the pool.
     """
@@ -3884,7 +3885,12 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     status = getattr(exc, "status_code", None) or getattr(
         getattr(exc, "response", None), "status_code", None
     )
-    return isinstance(status, int) and (status == 408 or 500 <= status < 600)
+    if isinstance(status, int) and (status == 408 or 500 <= status < 600):
+        return True
+
+    from agent.error_classifier import FailoverReason, classify_api_error
+
+    return classify_api_error(exc).reason is FailoverReason.overloaded
 
 
 _DEFAULT_TRANSIENT_RETRIES = 2
