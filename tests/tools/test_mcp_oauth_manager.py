@@ -334,9 +334,10 @@ def test_bridge_forwards_requests_and_poisons_on_token_endpoint_400(
 
     async def fake_base_flow(self, request):
         # Mimic the SDK: yield the request, receive the response, then finish.
-        forwarded.append(("out", request))
-        response = yield request
-        forwarded.append(("in", response))
+        async with self.context.lock:
+            forwarded.append(("out", request))
+            response = yield request
+            forwarded.append(("in", response))
 
     from mcp.client.auth.oauth2 import OAuthClientProvider
     monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_base_flow)
@@ -421,8 +422,10 @@ async def test_manager_malformed_201_token_response_does_not_expose_body(
 
 @pytest.mark.asyncio
 async def test_manager_token_read_error_does_not_expose_body(tmp_path, monkeypatch):
-    import httpx
     from mcp.client.auth.oauth2 import OAuthTokenError
+    from tools.mcp_tool import sdk_httpx
+
+    httpx = sdk_httpx()
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = _provider_with_token_endpoint(
@@ -469,7 +472,9 @@ async def test_manager_malformed_201_refresh_response_clears_tokens(
 
 @pytest.mark.asyncio
 async def test_manager_refresh_read_error_clears_tokens(tmp_path, monkeypatch):
-    import httpx
+    from tools.mcp_tool import sdk_httpx
+
+    httpx = sdk_httpx()
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = _provider_with_token_endpoint(

@@ -109,7 +109,7 @@ async def test_sentinel_placed_before_agent_setup():
 
 
 @pytest.mark.asyncio
-async def test_goal_continuation_uses_stashed_streamed_final_response():
+async def test_goal_continuation_uses_streamed_event_final_response():
     """Streaming platforms return None to avoid duplicate sends, but the
     post-turn goal hook still needs the already-delivered final text."""
     runner = _make_runner()
@@ -117,9 +117,7 @@ async def test_goal_continuation_uses_stashed_streamed_final_response():
     final_response = "partial progress; keep going"
 
     async def mock_inner(self_inner, ev, src, qk, generation):
-        runner._post_turn_agent_results = {
-            qk: {"final_response": final_response, "already_sent": True}
-        }
+        ev._streamed_final_response = final_response
         return None
 
     runner._post_turn_goal_continuation = AsyncMock()
