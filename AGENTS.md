@@ -2,6 +2,11 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## ローカル fork のブランチ運用
+
+- `main` は upstream の公式 release 追従専用とし、独自修正を載せない。
+- 環境固有・未マージの hotfix は `ryonakae` だけへ統合する。
+
 **Never give up on the right solution.**
 
 ## What Hermes Is
