@@ -170,7 +170,7 @@ class StreamTransportMixin:
 
     async def _send_draft_frame(self, text: str) -> bool:
         """Emit one draft frame; any failure permanently disables drafts for this run.
-        Drafts have no message_id and clear on the client when the final send lands."""
+        A failed frame may return an existing editable message for fallback recovery."""
         if self._draft_id is None:
             # Should never happen (set in tandem with _use_draft_streaming in run()).
             self._use_draft_streaming = False
@@ -198,6 +198,14 @@ class StreamTransportMixin:
                     "is not approved for this connection)"
                 )
                 self._egress_declined = True
+            elif getattr(result, "message_id", None):
+                # Slack drafts are real messages. Keep their ID on transport failure so
+                # edits replace the preview instead of posting beside it. If editing
+                # also fails, resend the full answer before deleting this uncertain frame.
+                self._adopt_message_id(result.message_id)
+                self._track_preview_ids_from_result(result)
+                self._already_sent = True
+                self._last_sent_text = ""
             logger.debug("send_draft returned success=False, disabling draft transport: %s",
                          getattr(result, "error", "unknown"))
         self._draft_failures += 1

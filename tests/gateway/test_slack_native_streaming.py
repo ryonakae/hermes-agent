@@ -163,6 +163,33 @@ class TestFeatureGateFallback:
 
 class TestSendFinalization:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("sent", "final", "same_answer"),
+        [
+            ("\n\n**Answer**\n", "**Answer**", True),
+            ("**Answer**\n", "**Answer**", True),
+            ("**Answer**", "\n**Answer**\n", True),
+            ("\nFirst answer\n", "Different answer", False),
+            ("\nFirst\nanswer\n", "First answer", False),
+            ("\n \n", "", False),
+        ],
+    )
+    async def test_final_boundary_whitespace_does_not_duplicate(self, sent, final, same_answer):
+        adapter, client = _make_adapter()
+        draft = await adapter.send_draft("D1", 7, sent, metadata=META)
+        result = await adapter.send("D1", final, metadata=META)
+        assert result.success
+        if same_answer:
+            assert result.message_id == draft.message_id
+            client.chat_stopStream.assert_awaited_once()
+            assert "markdown_text" not in client.chat_stopStream.await_args.kwargs
+            client.chat_postMessage.assert_not_awaited()
+            assert not adapter._active_streams
+        else:
+            client.chat_stopStream.assert_not_awaited()
+            assert adapter._active_streams["D1"]["ts"] == draft.message_id
+
+    @pytest.mark.asyncio
     async def test_final_send_seals_stream_no_duplicate_post(self):
         adapter, client = _make_adapter()
         await adapter.send_draft("D1", 7, "Hello wo", metadata=META)

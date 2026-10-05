@@ -2494,13 +2494,16 @@ class SlackAdapter(BasePlatformAdapter):
                 # the frame so the consumer falls back to the edit path.
                 await self._seal_stream(chat_id, stream)
                 self._active_streams.pop(chat_id, None)
-                return SendResult(success=False, error="stream prefix mismatch")
+                return SendResult(
+                    success=False, error="stream prefix mismatch", message_id=stream["ts"])
             delta = text[len(sent) :]
             await client.chat_appendStream(channel=chat_id, ts=stream["ts"], markdown_text=delta)
             stream["sent"] = text
             return SendResult(success=True, message_id=stream["ts"])
         except Exception as e:  # pragma: no cover - network/API errors
             self._active_streams.pop(chat_id, None)
+            if stream is not None:
+                await self._seal_stream(chat_id, stream)
             err = str(e)
             # Feature-gate errors: remember unsupported so later responses
             # skip the native attempt instead of erroring each time.
@@ -2512,7 +2515,8 @@ class SlackAdapter(BasePlatformAdapter):
                     "for this Slack app (and ensure the assistant:write scope).", err)
             else:
                 logger.debug("[Slack] Native stream frame failed: %s", err)
-            return SendResult(success=False, error=err)
+            return SendResult(
+                success=False, error=err, message_id=stream["ts"] if stream else None)
 
     async def _start_stream(
         self, client: Any, chat_id: str, draft_id: int, text: str,
@@ -2571,9 +2575,10 @@ class SlackAdapter(BasePlatformAdapter):
             return None
         sent = stream.get("sent", "")
         text = self._strip_stream_cursor(content)
-        # Only claim sends that extend what was streamed; an empty ``sent``
-        # prefix would match everything.
-        if not sent or not text.startswith(sent):
+        # Final-response cleanup may trim boundary whitespace. Equal nonblank bodies
+        # already occupy this stream; sealing needs no append or replacement post.
+        same_body = bool(sent.strip()) and text.strip() == sent.strip()
+        if not sent or (not text.startswith(sent) and not same_body):
             return None
         self._active_streams.pop(chat_id, None)
         ts = stream["ts"]
