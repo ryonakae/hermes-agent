@@ -427,11 +427,13 @@ class HermesProviderMixin:
             from tools.mcp_tool_common import _sanitize_error
             excerpt = " ".join(re.sub(r"<[^>]+>", " ", response.text).split())[:200]
             raise OAuthTokenError(f"Token exchange failed ({response.status_code}): {_sanitize_error(excerpt)}".rstrip(": "))
-        from httpx import HTTPError
+        from tools.mcp_tool import sdk_httpx
         from mcp.client.auth.utils import handle_token_response_scopes
+        httpx = sdk_httpx()
+        assert httpx is not None
         try:
             token_response = await handle_token_response_scopes(response)
-        except (HTTPError, OAuthTokenError):
+        except (httpx.HTTPError, OAuthTokenError):
             raise OAuthTokenError("Invalid token response") from None
         await self._store_tokens(token_response)
 
@@ -461,12 +463,14 @@ class HermesProviderMixin:
                 return True
             self.context.clear_tokens()
             return False
-        from httpx import HTTPError
+        from tools.mcp_tool import sdk_httpx
         from mcp.shared.auth import OAuthToken
         from pydantic import ValidationError
+        httpx = sdk_httpx()
+        assert httpx is not None
         try:
             token_response = OAuthToken.model_validate_json(await response.aread())
-        except (HTTPError, ValidationError):
+        except (httpx.HTTPError, ValidationError):
             self._hermes_logger.warning("Invalid refresh response: %s", response.status_code)
             self.context.clear_tokens()
             return False

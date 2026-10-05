@@ -14,14 +14,15 @@ from __future__ import annotations
 
 
 from hermes_cli.config import load_config
+from hermes_cli.config_defaults import DEFAULT_CONFIG
 from hermes_cli.main_provider_setup import _DELEGATION_TASK_KEY, _delegation_cfg_as_task, _format_aux_current, _reset_aux_to_auto, _save_aux_choice
 
 
 # ── Default config ──────────────────────────────────────────────────────────
 
 
-
-
+def test_compression_default_timeout_is_generous_for_large_sessions():
+    assert DEFAULT_CONFIG["auxiliary"]["compression"]["timeout"] == 300
 
 
 

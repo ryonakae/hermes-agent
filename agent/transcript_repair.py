@@ -45,10 +45,13 @@ def resolve_and_repair_transcript_batch(
         decoded = decode_content_fn(target_row["content"])
         msg["_row_id"] = target_id
         if is_content_blank(decoded):
+            from hermes_state_common import _fts_content_from_stored
+
+            encoded_content = encode_content_fn(msg.get("content"))
             conn.execute(
-                "UPDATE messages SET content = ? "
+                "UPDATE messages SET content = ?, fts_content = ? "
                 "WHERE id = ? AND session_id = ? AND active = 1",
-                (encode_content_fn(msg.get("content")), target_id, session_id),
+                (encoded_content, _fts_content_from_stored(encoded_content), target_id, session_id),
             )
         else:
             msg["_canonical_content"] = decoded  # concurrent winner: adopt, don't overwrite

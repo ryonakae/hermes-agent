@@ -145,6 +145,81 @@ class TestEditMessageFinalizeSignature:
         )
 
 
+class TestEditMessageMetadataCompatibility:
+    """Streaming edits tolerate forwarding wrappers around metadata-blind adapters."""
+
+    @pytest.mark.asyncio
+    async def test_metadata_retry_when_observer_hides_signature(self):
+        class MetadataBlindAdapter:
+            MAX_MESSAGE_LENGTH = 4096
+            REQUIRES_EDIT_FINALIZE = False
+
+            def __init__(self):
+                self.edits = []
+
+            async def send(self, **kwargs):
+                return SimpleNamespace(success=True, message_id="msg_1")
+
+            async def edit_message(self, *args, **kwargs):
+                return await self._original_edit_message(*args, **kwargs)
+
+            async def _original_edit_message(self, chat_id, message_id, content, *, finalize=False):
+                self.edits.append({
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "content": content,
+                    "finalize": finalize,
+                })
+                return SimpleNamespace(success=True, message_id=message_id)
+
+        adapter = MetadataBlindAdapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            metadata={"thread_id": "thread_1"},
+        )
+
+        result = await consumer._edit_message(
+            message_id="msg_1",
+            content="updated",
+            finalize=True,
+        )
+
+        assert result.success is True
+        assert adapter.edits == [{
+            "chat_id": "chat_123",
+            "message_id": "msg_1",
+            "content": "updated",
+            "finalize": True,
+        }]
+
+    @pytest.mark.asyncio
+    async def test_internal_metadata_type_error_is_not_retried(self):
+        class InternalMetadataErrorAdapter:
+            def __init__(self):
+                self.calls = 0
+
+            async def edit_message(self, *args, **kwargs):
+                self.calls += 1
+                raise TypeError("internal metadata validation failed")
+
+        adapter = InternalMetadataErrorAdapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            metadata={"thread_id": "thread_1"},
+        )
+
+        with pytest.raises(TypeError, match="internal metadata validation failed"):
+            await consumer._edit_message(
+                message_id="msg_1",
+                content="updated",
+                finalize=True,
+            )
+
+        assert adapter.calls == 1
+
+
 class TestSendOrEditMediaStripping:
     """Verify _send_or_edit strips MEDIA: before sending to the platform."""
 

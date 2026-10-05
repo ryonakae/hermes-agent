@@ -18,17 +18,17 @@ from agent.message_sanitization import _sanitize_surrogates
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
     _COMPRESSION_LOCK_ROW_SQL, _ENDED_ROW_SQL, _RESET_END_REASONS, _RESET_END_REASONS_SQL, _ended_by_compression,
-    _legacy_reset_child_sql, _placeholders, _sql_json_extract)
+    _fts_content_from_stored, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
 
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
 
 # One INSERT shape for every message writer (append, batch, replace, compact, import).
-_INSERT_MESSAGE_SQL = """INSERT INTO messages (session_id, role, content, tool_call_id,
+_INSERT_MESSAGE_SQL = """INSERT INTO messages (session_id, role, content, fts_content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind,
                    display_metadata, display_identity)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 # Every column this module knows how to read: the ones it writes plus the three SQLite/compaction
 # owns. `_row_to_message_dict` drops raw bytes ONLY outside this set — a schema column keeps its
 # key (and its typed decoder) even when a row holds a BLOB, so no reader ever loses msg["content"].
@@ -265,6 +265,7 @@ class SessionMessagesMixin:
         _str_or_none = lambda v: _scrub_surrogates(v) if isinstance(v, str) else None  # noqa: E731
         _reasoning = lambda key: msg.get(key) if keep_reasoning else None  # noqa: E731
         encoded_content = self._encode_content(msg.get("content"))
+        fts_content = _fts_content_from_stored(encoded_content)
         encoded_tool_calls = json.dumps(tool_calls) if tool_calls else None
         encoded_tool_name = _scrub_surrogates(msg.get("tool_name"))
         display_metadata = self._encode_display_metadata(msg.get("display_metadata"))
@@ -274,7 +275,7 @@ class SessionMessagesMixin:
             "tool_name": encoded_tool_name, "display_kind": msg.get("display_kind"),
             "display_metadata": display_metadata,
         }
-        return (session_id, role, encoded_content, msg.get("tool_call_id"),
+        return (session_id, role, encoded_content, fts_content, msg.get("tool_call_id"),
             encoded_tool_calls, encoded_tool_name,
             msg.get("effect_disposition"), message_timestamp, msg.get("token_count"), msg.get("finish_reason"),
             _scrub_surrogates(_reasoning("reasoning")), _scrub_surrogates(_reasoning("reasoning_content")),
@@ -863,9 +864,11 @@ class SessionMessagesMixin:
         raw keystrokes, and the turn must not append a second row for the same input."""
         if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
             return 0
+        encoded_content = self._encode_content(content)
         return self._write_rowcount(
-            "UPDATE messages SET content = ? WHERE id = ? AND session_id = ? AND role = 'user' AND active = 1",
-            (self._encode_content(content), row_id, session_id))
+            "UPDATE messages SET content = ?, fts_content = ? "
+            "WHERE id = ? AND session_id = ? AND role = 'user' AND active = 1",
+            (encoded_content, _fts_content_from_stored(encoded_content), row_id, session_id))
 
     def _display_dedupe_key(self, row) -> Tuple[Any, ...]:
         """Historical display identity, including normalized live content from user handoff carriers."""

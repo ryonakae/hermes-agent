@@ -1710,7 +1710,8 @@ def route_classified_error(
     """Ordered (load-bearing) recovery steps between classification and overflow handling:
     compaction-disabled overflow → terminal error (output-cap errors exempt); Anthropic
     long-context tier 429 → cap at 200k and compress; eager fallback for rate-limit/billing
-    (immediately) and transport failures (after 1 retry) unless credential-pool rotation may
+    (immediately) and an explicitly configured timeout (immediately), while other transport
+    failures retain the upstream retry threshold, unless credential-pool rotation may
     still recover (upstream-aggregator 429s always fall back); persistent 401/403 → fallback
     chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once."""
     from agent.conversation_compression import conversation_history_after_compression
@@ -1818,6 +1819,13 @@ def route_classified_error(
         if classified.reason == FailoverReason.rate_limit else None
     )
     _is_transport_failure = classified.reason in _TRANSPORT_FAILURE_REASONS
+    _is_eager_timeout = (
+        classified.reason == FailoverReason.timeout
+        and bool(getattr(agent, "_eager_fallback_on_timeout", False))
+    )
+    # The opt-in timeout path is the only transport exception to the upstream
+    # retry threshold: one stale-killed stream should switch providers now.
+    # Keep overloaded/other transport errors on their existing retry path.
     # Z.AI overload 429s classify `overloaded`, which `is_rate_limited` excludes. Detect
     # directly so the long backoff runs, and raise the ceiling to reach it.
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
@@ -1825,6 +1833,7 @@ def route_classified_error(
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
     _should_fallback = (
         (is_rate_limited and _wrapped_output_cap_budget is None)
+        or _is_eager_timeout
         or (_is_transport_failure and retry_count >= 2)
     )
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
@@ -1833,7 +1842,9 @@ def route_classified_error(
         # Fixes #11314.
         _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
         pool_may_recover = (
-            False if _is_upstream else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
+            False
+            if _is_upstream or _is_eager_timeout
+            else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
         if not pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))

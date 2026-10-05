@@ -40,7 +40,13 @@ class StreamTransportMixin:
                     kwargs["metadata"] = self.metadata
             except (TypeError, ValueError):
                 pass
-        return await self.adapter.edit_message(**kwargs)
+        try:
+            return await self.adapter.edit_message(**kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument 'metadata'" not in str(exc) or "metadata" not in kwargs:
+                raise
+            kwargs.pop("metadata", None)
+            return await self.adapter.edit_message(**kwargs)
 
     async def _try_seed_frame(self, fail_log: str, *, exc_info: bool = False) -> bool:
         """Open a native stream with an empty seed frame (typing indicator before any token) as a

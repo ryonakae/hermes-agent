@@ -5,6 +5,11 @@ This root file holds only what applies everywhere. Each area has its own `AGENTS
 ~8k chars; `agent/subdirectory_hints.py` delivers up to 32k and truncates head/tail with a warning
 past that); see the **routing table** at the end and read the area file before editing in that area.
 
+## ローカル fork のブランチ運用
+
+- `main` は upstream の公式 release 追従専用とし、独自修正を載せない。
+- `ryonakae` は実運用のアクティブブランチ。環境固有・未マージの hotfix はここだけへ統合し、更新時も実運用を `main` に切り替えない。
+
 **Never give up on the right solution.**
 
 ## What Hermes Is

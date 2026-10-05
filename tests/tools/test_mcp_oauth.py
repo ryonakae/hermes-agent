@@ -243,7 +243,9 @@ class TestBuildOAuthAuth:
 
     @pytest.mark.asyncio
     async def test_token_response_accepts_201_created(self, tmp_path, monkeypatch):
-        import httpx
+        from tools.mcp_tool import sdk_httpx
+        httpx = sdk_httpx()
+        assert httpx is not None
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         _set_interactive_stdin(monkeypatch)
@@ -269,7 +271,9 @@ class TestBuildOAuthAuth:
     async def test_failed_token_exchange_carries_a_bounded_redacted_excerpt(self, tmp_path, monkeypatch):
         """A non-2xx body names the cause (WAF "Request blocked" vs ``invalid_grant``) without HTML,
         beyond 200 characters or credential-shaped spans (#115329)."""
-        import httpx
+        from tools.mcp_tool import sdk_httpx
+        httpx = sdk_httpx()
+        assert httpx is not None
         from mcp.client.auth.oauth2 import OAuthTokenError
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -286,6 +290,55 @@ class TestBuildOAuthAuth:
         assert "[REDACTED]" in message
         assert "<" not in message and "leaked-bearer-token" not in message
         assert len(message) <= len("Token exchange failed (403): ") + 200
+        assert provider.context.current_tokens is None
+
+    @pytest.mark.asyncio
+    async def test_token_read_error_does_not_expose_body(self, tmp_path, monkeypatch):
+        """SDK transport read failures become a generic OAuth error (#2667773a99)."""
+        from tools.mcp_tool import sdk_httpx
+        httpx = sdk_httpx()
+        assert httpx is not None
+        from mcp.client.auth.oauth2 import OAuthTokenError
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+        provider = build_oauth_auth("supabase", "https://mcp.supabase.com/mcp")
+        assert provider is not None
+
+        class _ReadErrorResponse:
+            status_code = 201
+
+            async def aread(self):
+                raise httpx.ReadError("access-secret refresh-secret")
+
+        with pytest.raises(OAuthTokenError, match="^Invalid token response$") as exc_info:
+            await provider._handle_token_response(_ReadErrorResponse())
+
+        assert "access-secret" not in str(exc_info.value)
+        assert "refresh-secret" not in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_refresh_read_error_clears_tokens(self, tmp_path, monkeypatch):
+        """SDK transport read failures clear unusable refresh state (#2a0d5de75f)."""
+        from tools.mcp_tool import sdk_httpx
+        httpx = sdk_httpx()
+        assert httpx is not None
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+        provider = build_oauth_auth("supabase", "https://mcp.supabase.com/mcp")
+        assert provider is not None
+        provider.context.current_tokens = object()
+
+        class _ReadErrorResponse:
+            status_code = 201
+
+            async def aread(self):
+                raise httpx.ReadError("body read failed")
+
+        result = await provider._handle_refresh_response(_ReadErrorResponse())
+
+        assert result is False
         assert provider.context.current_tokens is None
 
 

@@ -570,7 +570,13 @@ class TurnRunner:
             kwargs["finalize"] = True
         if st._edit_accepts_metadata:
             kwargs["metadata"] = ctx._progress_metadata
-        return await st.adapter.edit_message(**kwargs)
+        try:
+            return await st.adapter.edit_message(**kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument 'metadata'" not in str(exc) or "metadata" not in kwargs:
+                raise
+            kwargs.pop("metadata", None)
+            return await st.adapter.edit_message(**kwargs)
 
     @staticmethod
     def _progress_text(lines: list) -> str:

@@ -996,17 +996,25 @@ class SessionDB(
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    conn = cast(sqlite3.Connection, self._conn)
+                    previous_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                    remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+                    conn.execute(f"PRAGMA busy_timeout={min(previous_ms, remaining_ms)}")
                     try:
-                        fn_started = True
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+                        conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
+                            fn_started = True
+                            result = fn(conn)
+                            conn.commit()
+                        except BaseException:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            raise
+                    finally:
+                        with suppress(sqlite3.Error):
+                            conn.execute(f"PRAGMA busy_timeout={previous_ms}")
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:

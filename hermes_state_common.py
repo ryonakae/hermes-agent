@@ -259,7 +259,15 @@ AUTO_VACUUM_MIN_FREELIST_RATIO = 0.25
 #       back EXACTLY what the triggers indexed, so the rank=1
 #       'integrity-check' probe cannot drift from the stored index (the
 #       recurring fts5 "checksum mismatch" / leaked-token failures).
-FTS_STORAGE_VERSION = 3
+FTS_STORAGE_VERSION = 4
+
+# Projection migrations publish this breadcrumb before replacing an external
+# content surface and clear it only after the rebuilt index is durable.  A
+# reopened process therefore retries an interrupted swap instead of stamping a
+# newer layout over an index whose view and token stream disagree.
+FTS_PROJECTION_PENDING_KEY = "fts_projection_rebuild_pending"
+FTS_TRIGRAM_PROJECTION_PENDING_KEY = "fts_trigram_projection_rebuild_pending"
+FTS_CJK_PROJECTION_PENDING_KEY = "fts_cjk_projection_rebuild_pending"
 
 # Tool results are often multi-megabyte machine payloads. The base FTS index
 # stores only a bounded prefix of every tool row; tool rows are skipped by
@@ -273,9 +281,30 @@ FTS_TOOL_CONTENT_PREFIX_CHARS = 8_192
 
 
 def _fts_indexed_content_sql(alias: str) -> str:
+    content = f"{alias}.content"
+    projected = (
+        f"CASE WHEN substr(CAST({content} AS BLOB), 1, 6) = X'006A736F6E3A' "
+        f"THEN COALESCE({alias}.fts_content, '') ELSE {content} END"
+    )
     return f"""CASE WHEN {alias}.role = 'tool'
-         THEN substr(COALESCE({alias}.content, ''), 1, {FTS_TOOL_CONTENT_PREFIX_CHARS})
-         ELSE {alias}.content END"""
+         THEN substr(COALESCE({projected}, ''), 1, {FTS_TOOL_CONTENT_PREFIX_CHARS})
+         ELSE {projected} END"""
+
+
+def _fts_content_from_stored(content: Any) -> str | None:
+    """Extract searchable text from the sentinel-encoded durable content."""
+    if not (isinstance(content, str) and content.startswith("\x00json:")):
+        return None
+    try:
+        decoded = json.loads(content[6:])
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    parts = decoded if isinstance(decoded, list) else [decoded]
+    text_parts: list[str] = []
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+            text_parts.append(part["text"])
+    return " ".join(text_parts).replace("\x00", " ")
 
 
 _FTS_NEW_INDEXED_CONTENT_SQL = _fts_indexed_content_sql("new")
@@ -404,6 +433,7 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL REFERENCES sessions(id),
     role TEXT NOT NULL,
     content TEXT,
+    fts_content TEXT,
     tool_call_id TEXT,
     tool_calls TEXT,
     tool_name TEXT,
@@ -712,12 +742,8 @@ FTS_SQL = f"""
 -- computes EXACTLY what the triggers/backfill insert, so 'rebuild' and the
 -- integrity checker always agree with the stored index.
 CREATE VIEW IF NOT EXISTS messages_fts_src AS
-    SELECT id,
-           CASE WHEN role = 'tool'
-                THEN substr(COALESCE(content, ''), 1, {FTS_TOOL_CONTENT_PREFIX_CHARS})
-                ELSE content END AS content,
-           tool_name, tool_calls
-    FROM messages;
+    SELECT m.id, {_fts_indexed_content_sql('m')} AS content, m.tool_name, m.tool_calls
+    FROM messages AS m;
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
@@ -762,8 +788,9 @@ END;
 -- (status/compacted/observed/etc.), which is stronger than the WHEN gate
 -- alone and avoids FTS I/O saturation on large state.db (#68858 / #73639).
 CREATE TRIGGER IF NOT EXISTS messages_fts_update
-AFTER UPDATE OF content, tool_name, tool_calls, role ON messages
+AFTER UPDATE OF content, fts_content, tool_name, tool_calls, role ON messages
 WHEN (old.content IS NOT new.content
+    OR old.fts_content IS NOT new.fts_content
     OR old.tool_name IS NOT new.tool_name
     OR old.tool_calls IS NOT new.tool_calls
     OR old.role IS NOT new.role)
@@ -834,7 +861,7 @@ FTS_TRIGRAM_SESSION_SQL = fts_trigram_session_sql()
 
 FTS_TRIGRAM_SQL = f"""
 CREATE VIEW IF NOT EXISTS messages_fts_trigram_src AS
-    SELECT m.id, m.role, m.content, m.tool_name
+    SELECT m.id, m.role, {_fts_indexed_content_sql('m')} AS content, m.tool_name
     FROM messages AS m
     JOIN sessions AS s ON s.id = m.session_id
     WHERE m.role <> 'tool' AND {fts_trigram_session_sql('s')};
@@ -857,7 +884,7 @@ WHEN new.role <> 'tool'
                             WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_trigram(rowid, content, tool_name)
-    VALUES (new.id, new.content, new.tool_name);
+    VALUES (new.id, {_FTS_NEW_INDEXED_CONTENT_SQL}, new.tool_name);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages
@@ -870,12 +897,13 @@ WHEN old.role <> 'tool'
                             WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name)
-    VALUES ('delete', old.id, old.content, old.tool_name);
+    VALUES ('delete', old.id, {_FTS_OLD_INDEXED_CONTENT_SQL}, old.tool_name);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update
-AFTER UPDATE OF content, tool_name, role ON messages
+AFTER UPDATE OF content, fts_content, tool_name, role ON messages
 WHEN (old.content IS NOT new.content
+    OR old.fts_content IS NOT new.fts_content
     OR old.tool_name IS NOT new.tool_name
     OR old.role IS NOT new.role)
    AND (old.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
@@ -884,12 +912,12 @@ WHEN (old.content IS NOT new.content
                             WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name)
-    SELECT 'delete', old.id, old.content, old.tool_name
+    SELECT 'delete', old.id, {_FTS_OLD_INDEXED_CONTENT_SQL}, old.tool_name
     WHERE old.role <> 'tool'
       AND EXISTS (SELECT 1 FROM sessions
                   WHERE id = old.session_id AND {FTS_TRIGRAM_SESSION_SQL});
     INSERT INTO messages_fts_trigram(rowid, content, tool_name)
-    SELECT new.id, new.content, new.tool_name
+    SELECT new.id, {_FTS_NEW_INDEXED_CONTENT_SQL}, new.tool_name
     WHERE new.role <> 'tool'
       AND EXISTS (SELECT 1 FROM sessions
                   WHERE id = new.session_id AND {FTS_TRIGRAM_SESSION_SQL});

@@ -85,6 +85,7 @@ class TestTranscriptWritePatience:
         """When patience genuinely runs out, the error must say the lock was
         held by another process — not read like disk/permission damage."""
         monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.2)
+        previous_timeout = db._conn.execute("PRAGMA busy_timeout").fetchone()[0]
 
         started = threading.Event()
         holder = threading.Thread(
@@ -101,6 +102,11 @@ class TestTranscriptWritePatience:
         text = str(excinfo.value)
         assert "another Hermes process" in text
         assert "healthy" in text
+        assert db.get_meta("k") is None
+        assert db._conn.execute("PRAGMA busy_timeout").fetchone()[0] == previous_timeout
+        db.set_meta("after-timeout", "ok")
+        assert db.get_meta("after-timeout") == "ok"
+        assert db._conn.execute("PRAGMA busy_timeout").fetchone()[0] == previous_timeout
 
     def test_write_succeeds_immediately_when_uncontended(self, db):
         """Patience must cost nothing when there is no contention."""

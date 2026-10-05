@@ -77,6 +77,11 @@ class _NoFtsExistingTableConnection(sqlite3.Connection):
 class _NoTrigramCursor(sqlite3.Cursor):
     """Simulate a SQLite build with FTS5 but without the trigram tokenizer."""
 
+    def execute(self, sql, parameters=()):
+        if "tokenize" in sql.lower() and "trigram" in sql.lower():
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return super().execute(sql, parameters)
+
     def executescript(self, sql_script):
         if "tokenize='trigram'" in sql_script:
             raise sqlite3.OperationalError("no such tokenizer: trigram")
@@ -84,6 +89,9 @@ class _NoTrigramCursor(sqlite3.Cursor):
 
 
 class _NoTrigramConnection(sqlite3.Connection):
+    def execute(self, sql, parameters=()):
+        return self.cursor().execute(sql, parameters)
+
     def cursor(self, factory=None):
         return super().cursor(factory or _NoTrigramCursor)
 
@@ -4225,14 +4233,11 @@ class TestFTSExternalContentMigration:
             assert db._conn is not None
             assert db.get_meta("fts_rebuild_high_water") is None
             assert db.get_meta("fts_rebuild_progress") is None
-            assert db._has_fts_trash(db._conn) is True
+            assert db.get_meta("fts_trigram_projection_rebuild_pending") == "1"
             assert db.fts_optimize_available() is True
             assert db.get_meta("fts_storage_version") == "1"
             if with_message:
-                assert db._conn.execute(
-                    "SELECT 1 FROM messages_fts_trigram "
-                    "WHERE messages_fts_trigram MATCH '部署完成' LIMIT 1"
-                ).fetchone()
+                assert len(db.search_messages("部署完成")) == 1
 
             result = db.optimize_fts_storage(vacuum=False)
             assert result["ok"] is True
@@ -4254,6 +4259,8 @@ class TestFTSExternalContentMigration:
             ).fetchone()[0]
             assert "tool_calls" not in trigger_sql
             assert db.get_meta("fts_storage_version") == str(FTS_STORAGE_VERSION)
+            for table in ("messages_fts", "messages_fts_trigram"):
+                db._conn.execute(f"INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1)")
         finally:
             db.close()
 

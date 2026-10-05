@@ -213,6 +213,28 @@ def test_v1_tool_calls_layout_is_left_for_optimize_storage(tmp_path):
         migrated.close()
 
 
+def test_legacy_tool_calls_startup_still_quarantines_missing_tokenizer(tmp_path, monkeypatch):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        _install_pre_v27_trigram(db, with_tool_calls=True)
+        probe = db._fts_table_probe
+        monkeypatch.setattr(db, "_trigram_tokenizer_is_loadable", lambda cursor: False)
+        monkeypatch.setattr(
+            db, "_fts_table_probe",
+            lambda cursor, table: None if table == "messages_fts_trigram" else probe(cursor, table),
+        )
+        db._init_fts(db._conn.cursor())
+        db._conn.commit()
+        assert not db._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+            "AND name IN ('messages_fts_trigram_insert','messages_fts_trigram_delete','messages_fts_trigram_update')"
+        ).fetchall()
+        db.create_session("writer", source="cli")
+        db.append_message("writer", "user", "canonical write survives")
+    finally:
+        db.close()
+
+
 def test_partial_upgrade_view_does_not_skip_historical_rebuild(tmp_path):
     db_path = tmp_path / "state.db"
     old = SessionDB(db_path=db_path)

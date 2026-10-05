@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from hermes_state import SessionDB
-from hermes_state_common import FTS_STORAGE_VERSION, SCHEMA_VERSION
+from hermes_state_common import FTS_STORAGE_VERSION, SCHEMA_VERSION, _fts_content_from_stored
 from hermes_state_repair import _db_opens_cleanly
 
 
@@ -49,6 +49,7 @@ _GENERATED_META_KEYS = frozenset({
     "fts_storage_version", "fts_optimize_available", "fts_rebuild_high_water", "fts_rebuild_progress",
     "fts_cjk_stale", "fts_cjk_rebuild_high_water", "fts_cjk_rebuild_progress", "telegram_dm_topic_schema_version",
     "fts_tool_full_content_high_water",  # retired marker; never copied into a recovered store
+    "fts_projection_rebuild_pending", "fts_trigram_projection_rebuild_pending", "fts_cjk_projection_rebuild_pending",
 })
 _SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
 _MINIMUM_SPACE_HEADROOM = 256 * 1024 * 1024
@@ -941,9 +942,32 @@ def _sanitize_session_model_config(destination: sqlite3.Connection) -> int:
         )
 
 
+def _backfill_fts_content(destination: sqlite3.Connection) -> int:
+    """Populate the durable text projection after a raw canonical-table copy."""
+    if "fts_content" not in _table_columns(destination, "messages"):
+        return 0
+    backfilled = 0
+    while True:
+        rows = destination.execute(
+            "SELECT id, content FROM messages "
+            "WHERE fts_content IS NULL "
+            "AND substr(CAST(content AS BLOB), 1, 6) = X'006A736F6E3A' "
+            "ORDER BY id LIMIT 500"
+        ).fetchall()
+        if not rows:
+            return backfilled
+        with _immediate_transaction(destination):
+            destination.executemany(
+                "UPDATE messages SET fts_content = ? WHERE id = ?",
+                [(_fts_content_from_stored(content), message_id) for message_id, content in rows],
+            )
+        backfilled += len(rows)
+
+
 def _finalize_derived_metadata(destination: sqlite3.Connection) -> dict[str, Any]:
     """Sanitize copied JSON columns and stamp metadata the new destination actually owns."""
     model_config_reset = _sanitize_session_model_config(destination)
+    fts_content_backfilled = _backfill_fts_content(destination)
     fts_tables = {
         str(row[0])
         for row in destination.execute(
@@ -951,7 +975,9 @@ def _finalize_derived_metadata(destination: sqlite3.Connection) -> dict[str, Any
         ).fetchall()
     }
     result: dict[str, Any] = {
-        "fts_tables": sorted(fts_tables), "finalized": False, "model_config_reset": model_config_reset}
+        "fts_tables": sorted(fts_tables), "finalized": False, "model_config_reset": model_config_reset,
+        "fts_content_backfilled": fts_content_backfilled,
+    }
     if fts_tables != {"messages_fts", "messages_fts_trigram"}:
         result["error"] = "fresh destination is missing required FTS tables"
         return result
@@ -1050,6 +1076,9 @@ def _recover_via_lost_and_found(
     try:
         mapping = map_lost_and_found_rows(lf_conn, destination_conn)
         stubbing = stub_missing_parent_sessions(destination_conn)
+        # lost_and_found inserts bypass normal message writers too; fill the
+        # projection before rebuilding external-content FTS indexes.
+        _backfill_fts_content(destination_conn)
         fts = rebuild_fts_indexes(destination_conn)
         derived_metadata = _finalize_derived_metadata(destination_conn)
     finally:

@@ -415,6 +415,14 @@ class IndentDumper(yaml.SafeDumper):
         return super().increase_indent(flow, False)
 
 
+def _represent_readable_string(dumper, data: str):
+    style = "|" if "\n" in data else None
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+
+IndentDumper.add_representer(str, _represent_readable_string)
+
+
 def atomic_yaml_write(path: Union[str, Path], data: Any, *, default_flow_style: bool = False, sort_keys: bool = False,
                       extra_content: str | None = None, create_mode: "int | None" = None) -> None:
     """Write YAML to *path* atomically (temp file + fsync + replace)."""

@@ -21,12 +21,19 @@ from hermes_constants import get_hermes_home
 from hermes_startup_watchdog import report_startup_progress
 from utils import safe_json_loads
 from hermes_state_common import (
-    DEFERRED_INDEX_SQL, FTS_CJK_STALE_KEY, FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY, FTS_SQL,
+    DEFERRED_INDEX_SQL, FTS_CJK_PROJECTION_PENDING_KEY, FTS_CJK_STALE_KEY, FTS_PROJECTION_PENDING_KEY,
+    FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY, FTS_SQL,
     FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS, FTS_TRIGRAM_SQL, LEGACY_FTS_SQL,
-    LEGACY_FTS_TRIGRAM_SQL, SCHEMA_SQL,
-    SCHEMA_VERSION, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS, _ephemeral_child_sql, _sql_json_extract, fts_rebuild_admission,
+    LEGACY_FTS_TRIGRAM_SQL, SCHEMA_SQL, FTS_TRIGRAM_PROJECTION_PENDING_KEY,
+    SCHEMA_VERSION, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS, _ephemeral_child_sql, _fts_content_from_stored,
+    _sql_json_extract, fts_rebuild_admission,
 )
-from hermes_state_fts import _drop_orphan_fts_shadow_tables
+from hermes_state_fts import (
+    FTS_CJK_TRIGGER_SQL,
+    _drop_orphan_fts_shadow_tables,
+    _drop_trigger_family,
+    _quarantine_trigger_family,
+)
 from hermes_state_holders import _read_proc_argv
 from hermes_state_errors import is_sqlite_lock_error
 
@@ -215,9 +222,7 @@ class SessionSchemaMixin:
 
     def _drop_all_fts_triggers(self, cursor: sqlite3.Cursor) -> None:
         self._drop_fts_triggers(cursor)
-        for trigger in _FTS_CJK_TRIGGERS:
-            with contextlib.suppress(sqlite3.OperationalError):
-                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        _drop_trigger_family(cursor, _FTS_CJK_TRIGGERS)
 
     @staticmethod
     def _fts_triggers_missing(cursor: sqlite3.Cursor, names: Sequence[str]) -> bool:
@@ -294,6 +299,14 @@ class SessionSchemaMixin:
         return row is not None and "messages_fts_src" not in (row[0] or "")
 
     @staticmethod
+    def _fts_view_needs_projection(cursor: sqlite3.Cursor, view_name: str) -> bool:
+        """True when an external-content view still exposes raw multimodal JSON."""
+        row = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = ?", (view_name,)
+        ).fetchone()
+        return row is not None and "fts_content" not in (row[0] or "").lower()
+
+    @staticmethod
     def _execute_ddl_skipping_settled_triggers(cursor: sqlite3.Cursor, ddl: str) -> None:
         """Run *ddl* statement by statement, skipping each ``DROP TRIGGER IF EXISTS x`` /
         ``CREATE TRIGGER IF NOT EXISTS x …`` pair whose trigger already exists with the same body.
@@ -349,21 +362,50 @@ class SessionSchemaMixin:
         from the view, under the shared cross-process rebuild admission. Legacy inline DBs
         skip this entirely (their index is self-contained; they still take the DDL on the
         optimize path)."""
-        if legacy or not self._sqlite_table_exists(cursor, "messages_fts"):
+        pending = cursor.execute(
+            "SELECT 1 FROM state_meta WHERE key = ?", (FTS_PROJECTION_PENDING_KEY,)
+        ).fetchone() is not None
+        projection_old = self._fts_view_needs_projection(cursor, "messages_fts_src")
+        if legacy or (not pending and not projection_old and not self._fts_index_is_misaligned_source(cursor)):
             return
         if not self._fts_index_is_misaligned_source(cursor):
-            return
+            # A durable marker with the new view is a backfill/finalization debt,
+            # not a reason to repeat the structural swap on every reopen.
+            if pending and not projection_old:
+                return
+            if not pending and not projection_old:
+                return
         has_messages = cursor.execute("SELECT 1 FROM messages LIMIT 1").fetchone() is not None
+
+        # This write is deliberately before any DROP/CREATE.  DDL uses
+        # executescript and may commit independently, so the breadcrumb is the
+        # durable recovery point if the process dies between those statements.
+        cursor.execute(
+            "INSERT INTO state_meta(key, value) VALUES(?, '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'",
+            (FTS_PROJECTION_PENDING_KEY,),
+        )
+        for name in _FTS_BASE_TRIGGERS:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
 
         def do_align() -> None:
             for name in _FTS_BASE_TRIGGERS:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
             cursor.execute("DROP TABLE IF EXISTS messages_fts")
+            cursor.execute("DROP VIEW IF EXISTS messages_fts_src")
             self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
             if has_messages:
-                cursor.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+                # Startup only installs the empty aligned surface.  The populated
+                # index is rebuilt by the existing bounded optimize path after the
+                # durable text projection backfill; doing it here makes every open
+                # pay the full rebuild and can read NULL fts_content from old rows.
+                _drop_trigger_family(cursor, _FTS_BASE_TRIGGERS)
+                cursor.execute(_CLEAR_REBUILD_MARKERS_SQL)
+                cursor.execute(_DROP_RETIRED_TOOL_HIGH_WATER_SQL)
+                return
             cursor.execute(_CLEAR_REBUILD_MARKERS_SQL)
             cursor.execute(_DROP_RETIRED_TOOL_HIGH_WATER_SQL)
+            cursor.execute("DELETE FROM state_meta WHERE key = ?", (FTS_PROJECTION_PENDING_KEY,))
             cursor.execute(_STATE_META_UPSERT_SQL, ("fts_storage_version", str(FTS_STORAGE_VERSION)))
 
         if not has_messages:
@@ -378,6 +420,121 @@ class SessionSchemaMixin:
                 raise
             return
         self._run_admitted_startup_rebuild(cursor, do_align)
+
+    def _migrate_trigram_projection_source(self, cursor: sqlite3.Cursor) -> None:
+        """Replace a pre-projection trigram view and rebuild it under a durable fence."""
+        pending = cursor.execute(
+            "SELECT 1 FROM state_meta WHERE key = ?", (FTS_TRIGRAM_PROJECTION_PENDING_KEY,)
+        ).fetchone() is not None
+        old_view = self._fts_view_needs_projection(cursor, "messages_fts_trigram_src")
+        if pending and not old_view:
+            _drop_trigger_family(cursor, _FTS_TRIGRAM_TRIGGERS)
+            self._trigram_available = False
+            return
+        if not pending and not old_view:
+            # A current projection with no durable pending marker still needs a
+            # capability check.  A runtime that cannot load the tokenizer must
+            # quarantine this optional surface before any writer can publish into
+            # it; a capable reopen can retry the migration later.
+            if self._trigram_tokenizer_is_loadable(cursor):
+                return
+            cursor.execute(
+                "INSERT INTO state_meta(key, value) VALUES(?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
+            )
+            _drop_trigger_family(cursor, _FTS_TRIGRAM_TRIGGERS)
+            self._trigram_available = False
+            return
+        if not self._trigram_tokenizer_is_loadable(cursor):
+            # Keep an old projection readable, but never leave its writer route
+            # live when this runtime cannot replace it with the current view.
+            live = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                f"AND name IN ({','.join('?' for _ in _FTS_TRIGRAM_TRIGGERS)}) LIMIT 1",
+                _FTS_TRIGRAM_TRIGGERS,
+            ).fetchone()
+            if live:
+                # The old surface is still readable; detach only its writer
+                # route.  A capable runtime will retry from the old view.
+                _drop_trigger_family(cursor, _FTS_TRIGRAM_TRIGGERS)
+            else:
+                # No writer route remains, so retain a durable migration debt
+                # marker for a future runtime that can load trigram.
+                _quarantine_trigger_family(
+                    cursor, FTS_TRIGRAM_PROJECTION_PENDING_KEY, _FTS_TRIGRAM_TRIGGERS
+                )
+            self._trigram_available = False
+            return
+        cursor.execute(
+            "INSERT INTO state_meta(key, value) VALUES(?, '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'",
+            (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
+        )
+        for name in _FTS_TRIGRAM_TRIGGERS:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+        has_messages = cursor.execute("SELECT 1 FROM messages WHERE role <> 'tool' LIMIT 1").fetchone() is not None
+
+        def rebuild() -> None:
+            for name in _FTS_TRIGRAM_TRIGGERS:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+            cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+            cursor.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+            if not self._ensure_fts_schema(cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL):
+                raise sqlite3.OperationalError("trigram tokenizer unavailable during projection migration")
+            if has_messages:
+                # Keep the optional writer route offline until the shared bounded
+                # projection backfill/finalization path can rebuild it safely.
+                _drop_trigger_family(cursor, _FTS_TRIGRAM_TRIGGERS)
+                return
+            cursor.execute("DELETE FROM state_meta WHERE key = ?", (FTS_TRIGRAM_PROJECTION_PENDING_KEY,))
+
+        self._run_admitted_startup_rebuild(cursor, rebuild)
+
+    def _migrate_cjk_projection_source(self, cursor: sqlite3.Cursor) -> None:
+        """Replace a pre-projection CJK source when the optional index is present."""
+        if not getattr(self, "_fts_cjk_loaded", False):
+            return
+        pending = cursor.execute(
+            "SELECT 1 FROM state_meta WHERE key = ?", (FTS_CJK_PROJECTION_PENDING_KEY,)
+        ).fetchone() is not None
+        old_view = self._fts_view_needs_projection(cursor, "messages_fts_cjk_src")
+        if pending and not old_view:
+            _drop_trigger_family(cursor, _FTS_CJK_TRIGGERS)
+            self._fts_cjk_available = False
+            return
+        if not pending and not old_view:
+            return
+        cursor.execute(
+            "INSERT INTO state_meta(key, value) VALUES(?, '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'",
+            (FTS_CJK_PROJECTION_PENDING_KEY,),
+        )
+        for name in _FTS_CJK_TRIGGERS:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+        has_messages = cursor.execute("SELECT 1 FROM messages WHERE role <> 'tool' LIMIT 1").fetchone() is not None
+
+        def rebuild() -> None:
+            for name in _FTS_CJK_TRIGGERS:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+            cursor.execute("DROP TABLE IF EXISTS messages_fts_cjk")
+            cursor.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
+            self._ensure_fts_cjk_schema(cursor)
+            if has_messages and cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts_cjk'"
+            ).fetchone():
+                # Defer the populated optional index to the existing bounded
+                # projection finalization path; startup must not full-rebuild it.
+                _drop_trigger_family(cursor, _FTS_CJK_TRIGGERS)
+                return
+            try:
+                self._execute_ddl_script_transactional(cursor, FTS_CJK_TRIGGER_SQL)
+            except BaseException:
+                _drop_trigger_family(cursor, _FTS_CJK_TRIGGERS)
+                raise
+            cursor.execute("DELETE FROM state_meta WHERE key = ?", (FTS_CJK_PROJECTION_PENDING_KEY,))
+
+        self._run_admitted_startup_rebuild(cursor, rebuild)
 
     @staticmethod
     def _sqlite_table_exists(cursor: sqlite3.Cursor, name: str) -> bool:
@@ -634,13 +791,20 @@ class SessionSchemaMixin:
     def _recover_stale_fts_locked(self, cursor: sqlite3.Cursor, *, legacy: bool) -> bool:
         """Body of :meth:`_recover_stale_fts`; caller holds rebuild authority. One write
         transaction, so no canonical writer slips between rebuild and trigger restoration."""
+        trigram_projection_pending = cursor.execute(
+            "SELECT 1 FROM state_meta WHERE key = ?",
+            (FTS_TRIGRAM_PROJECTION_PENDING_KEY,),
+        ).fetchone() is not None
         try:
             trigram_present = self._fts_table_probe(cursor, "messages_fts_trigram") is True
         except (sqlite3.DatabaseError, UnicodeDecodeError):
             # A corrupt vtable may fail even a LIMIT 0 probe; still include it in the drop-and-recreate.
-            include_trigram = True
+            include_trigram = not trigram_projection_pending
         else:
-            include_trigram = trigram_present or (not legacy and self._trigram_tokenizer_available(cursor))
+            include_trigram = (
+                not trigram_projection_pending
+                and (trigram_present or (not legacy and self._trigram_tokenizer_available(cursor)))
+            )
 
         drop_sql = "".join(f"DROP TRIGGER IF EXISTS {trigger};" for trigger in _FTS_TRIGGERS)
         if include_trigram:
@@ -975,8 +1139,9 @@ class SessionSchemaMixin:
             self._drop_all_fts_triggers(cursor)
         if not fts5_available:
             # Existing FTS triggers would still fire though this runtime cannot read their
-            # targets. Drop only the triggers; a future FTS5 runtime recreates them.
-            self._drop_fts_triggers(cursor)
+            # targets. Quarantine every writer family, including the optional CJK route;
+            # a partial cleanup must raise rather than silently publish a live writer.
+            self._drop_all_fts_triggers(cursor)
 
         row = cursor.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
         if row is None:
@@ -995,6 +1160,30 @@ class SessionSchemaMixin:
         if fts5_available:
             self._init_fts(cursor)
         self._conn.commit()
+
+    @staticmethod
+    def _backfill_fts_content(cursor: sqlite3.Cursor, after_id: int = 0, limit: int = 500) -> Optional[int]:
+        """Populate one bounded id slice of the durable text-only projection.
+
+        The caller commits each slice and persists its own cursor.  A killed
+        process therefore loses at most one slice and the next optimize run
+        resumes from the first still-NULL projection without loading payloads
+        for the whole database.
+        """
+        rows = cursor.execute(
+            "SELECT id, CASE WHEN fts_content IS NULL "
+            "AND substr(CAST(content AS BLOB), 1, 6) = X'006A736F6E3A' "
+            "THEN content END FROM messages WHERE id > ? "
+            "ORDER BY id LIMIT ?",
+            (after_id, limit),
+        ).fetchall()
+        if not rows:
+            return None
+        cursor.executemany(
+            "UPDATE messages SET fts_content = ? WHERE id = ?",
+            [(_fts_content_from_stored(row[1]), row[0]) for row in rows if row[1] is not None],
+        )
+        return int(rows[-1][0])
 
     def _run_data_migrations(self, cursor: sqlite3.Cursor, current_version: int, fts5_available: bool) -> None:
         """Version-gated chain for DATA migrations only (row backfills); column additions never
@@ -1172,6 +1361,37 @@ class SessionSchemaMixin:
         )
         if not self._fts_stale:
             self._migrate_misaligned_fts_source(cursor, legacy=legacy_fts)
+        if not self._fts_stale and not legacy_fts:
+            # The tool_calls layout is opt-in; its matching view must survive
+            # startup until optimize-storage replaces the table and view together.
+            if (not self._db_has_trigram_tool_calls_projection(cursor)
+                    or not self._trigram_tokenizer_is_loadable(cursor)):
+                self._migrate_trigram_projection_source(cursor)
+            if not self._fts_stale:
+                self._migrate_cjk_projection_source(cursor)
+        if not self._fts_stale:
+            projection_pending = {
+                row[0] for row in cursor.execute(
+                    "SELECT key FROM state_meta WHERE key IN (?, ?, ?)",
+                    (FTS_PROJECTION_PENDING_KEY, FTS_TRIGRAM_PROJECTION_PENDING_KEY,
+                     FTS_CJK_PROJECTION_PENDING_KEY),
+                ).fetchall()
+            }
+            if FTS_PROJECTION_PENDING_KEY in projection_pending:
+                # A base projection debt makes every derived route unsafe. Keep
+                # the durable marker and force canonical LIKE search until the
+                # explicit chunked optimizer finalizes the view/index pair.
+                self._drop_all_fts_triggers(cursor)
+                self._fts_stale = True
+                self._fts_enabled = True
+                self._trigram_available = self._fts_cjk_available = False
+                return
+            if FTS_TRIGRAM_PROJECTION_PENDING_KEY in projection_pending:
+                _drop_trigger_family(cursor, _FTS_TRIGRAM_TRIGGERS)
+                self._trigram_available = False
+            if FTS_CJK_PROJECTION_PENDING_KEY in projection_pending:
+                _drop_trigger_family(cursor, _FTS_CJK_TRIGGERS)
+                self._fts_cjk_available = False
         if self._fts_stale:
             if self._recover_stale_fts(cursor, legacy=legacy_fts):
                 # CJK was detached alongside the base indexes; its ensure path decides when it returns.
@@ -1193,7 +1413,15 @@ class SessionSchemaMixin:
                 self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", base_sql)
                 if not self._fts_enabled:
                     return
-                self._trigram_available = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
+                projection_pending = cursor.execute(
+                    "SELECT 1 FROM state_meta WHERE key = ?", (FTS_TRIGRAM_PROJECTION_PENDING_KEY,)
+                ).fetchone()
+                if projection_pending:
+                    for name in _FTS_TRIGRAM_TRIGGERS:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+                    self._trigram_available = False
+                else:
+                    self._trigram_available = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
                 self._rebuild_fts_indexes(
                     cursor, legacy=legacy_fts, include_trigram=self._trigram_available,
                 )
@@ -1209,7 +1437,15 @@ class SessionSchemaMixin:
                 self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", base_sql)
                 if self._fts_enabled:
                     # Trigram is optional; without it CJK search falls back to LIKE.
-                    trigram_enabled = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
+                    projection_pending = cursor.execute(
+                        "SELECT 1 FROM state_meta WHERE key = ?", (FTS_TRIGRAM_PROJECTION_PENDING_KEY,)
+                    ).fetchone()
+                    if projection_pending:
+                        for name in _FTS_TRIGRAM_TRIGGERS:
+                            cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+                        trigram_enabled = False
+                    else:
+                        trigram_enabled = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
                     self._trigram_available = trigram_enabled
                     if trigram_enabled and trigram_triggers_missing:
                         self._run_admitted_startup_rebuild(
@@ -1238,7 +1474,20 @@ class SessionSchemaMixin:
         """
         with fts_rebuild_admission(self.db_path) as admitted:
             if admitted:
-                rebuild_fn()
+                # The file lock serializes rebuild owners; the SQLite fence also
+                # excludes canonical writers from the DDL/trigger-publication gap.
+                # Commit the pre-fence breadcrumb first so an injected crash after
+                # structural DDL still leaves durable recovery state.
+                if self._conn.in_transaction:
+                    self._conn.commit()
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    rebuild_fn()
+                    self._conn.commit()
+                except BaseException:
+                    with contextlib.suppress(sqlite3.Error):
+                        self._conn.rollback()
+                    raise
                 return
         logger.warning(
             "Deferred startup FTS rebuild: another process holds the "
@@ -1246,6 +1495,7 @@ class SessionSchemaMixin:
         )
         cursor.execute(_STALE_KEY_UPSERT_SQL, (FTS_STALE_KEY,))
         self._drop_all_fts_triggers(cursor)
+        self._conn.commit()
         self._fts_stale = True
         self._fts_enabled = self._trigram_available = self._fts_cjk_available = False
 

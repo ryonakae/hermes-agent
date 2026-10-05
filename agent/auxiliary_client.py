@@ -3276,14 +3276,19 @@ def _is_connection_error(exc: Exception) -> bool:
 
 
 def _is_transient_transport_error(exc: Exception) -> bool:
-    """One-off transport blip worth retrying on the SAME provider: connection/stream-close errors plus pure 5xx/408.
+    """One-off transport blip worth retrying on the SAME provider: connection/stream-close errors, pure 5xx/408, or statusless overloads.
 
     Deliberately narrow: payment/auth/rate-limit errors switch provider, refresh creds, or rotate the pool.
     """
     if _is_connection_error(exc):
         return True
     status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-    return isinstance(status, int) and (status == 408 or 500 <= status < 600)
+    if isinstance(status, int) and (status == 408 or 500 <= status < 600):
+        return True
+
+    from agent.error_classifier import FailoverReason, classify_api_error
+
+    return classify_api_error(exc).reason is FailoverReason.overloaded
 
 
 _DEFAULT_TRANSIENT_RETRIES = 2

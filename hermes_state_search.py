@@ -5,6 +5,7 @@ Must never import hermes_state (cycle); shared constants live in hermes_state_co
 """
 
 import contextlib
+import json
 import logging
 import re
 import sqlite3
@@ -13,10 +14,18 @@ from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
-    FTS_CJK_STALE_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,
-    FTS_TRIGRAM_EXCLUDED_SOURCES, FTS_TRIGRAM_SQL,
-    MAX_FTS5_QUERY_CHARS, SCHEMA_VERSION, _FTS_CJK_TRIGGERS,
+    FTS_CJK_PROJECTION_PENDING_KEY, FTS_CJK_STALE_KEY, FTS_PROJECTION_PENDING_KEY, FTS_SQL,
+    FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,
+    FTS_TRIGRAM_EXCLUDED_SOURCES, FTS_TRIGRAM_PROJECTION_PENDING_KEY, FTS_TRIGRAM_SQL,
+    MAX_FTS5_QUERY_CHARS,
+    SCHEMA_VERSION, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS, _fts_indexed_content_sql,
     escape_like as _escape_like, fts_rebuild_admission, fts_trigram_session_sql, routed_sessions_setting,
+)
+from hermes_state_fts import (
+    FTS_CJK_TRIGGER_SQL,
+    _FTS_TRIGRAM_TRIGGERS,
+    _drop_trigger_family,
+    _execute_ddl_script_transactional,
 )
 
 # Pre-split logger identity so log filtering/capture is unchanged.
@@ -44,12 +53,23 @@ _QUOTED_PHRASE_RE = re.compile(r'"[^"]*"')
 
 # Column list shared by every search route (snippet + metadata, never content).
 _SEARCH_SELECT_TAIL = "m.timestamp, m.tool_name, s.source, s.model, s.started_at AS session_started"
-_LIKE_SNIPPET_SQL = "substr(m.content, max(1, instr(m.content, ?) - 40), 120) AS snippet"
+# Multimodal rows keep a NUL-prefixed JSON replay payload in ``content``.  The
+# durable text projection is the primary fallback source; stripping the sentinel
+# from the replay value keeps historical rows searchable before deferred backfill.
+_LIKE_CONTENT_SQL = (
+    "CASE WHEN substr(CAST(m.content AS BLOB), 1, 6) = X'006A736F6E3A' "
+    "THEN COALESCE(NULLIF(m.fts_content, ''), "
+    "CAST(substr(CAST(m.content AS BLOB), 7) AS TEXT)) "
+    "ELSE COALESCE(m.content, '') END"
+)
+_LIKE_SNIPPET_SQL = (
+    f"substr({_LIKE_CONTENT_SQL}, max(1, instr({_LIKE_CONTENT_SQL}, ?) - 40), 120) AS snippet"
+)
 _LIKE_ANY_COLUMN_SQL = (
-    "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
+    f"({_LIKE_CONTENT_SQL} LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
 )
 _LIKE_COALESCED_COLUMN_SQL = (
-    "(COALESCE(m.content, '') LIKE ? ESCAPE '\\' OR "
+    f"({_LIKE_CONTENT_SQL} LIKE ? ESCAPE '\\' OR "
     "COALESCE(m.tool_name, '') LIKE ? ESCAPE '\\' OR "
     "COALESCE(m.tool_calls, '') LIKE ? ESCAPE '\\')"
 )
@@ -84,6 +104,101 @@ def _meta_row(conn, key: str) -> Optional[sqlite3.Row]:
 
 def _delete_meta(conn, *keys: str) -> None:
     conn.execute(f"DELETE FROM state_meta WHERE key IN ({','.join('?' for _ in keys)})", keys)
+
+
+_PROJECTION_HIGH_WATER_KEY = "fts_projection_high_water"
+_PROJECTION_PROGRESS_KEY = "fts_projection_progress"
+_PROJECTION_STARTED_KEY = "fts_projection_started"
+_PROJECTION_SURFACES_KEY = "fts_projection_surfaces"
+_PROJECTION_DIRTY_TABLE = "fts_projection_dirty"
+_PROJECTION_DIRTY_TRIGGERS = (
+    "messages_fts_projection_dirty_insert",
+    "messages_fts_projection_dirty_update",
+    "messages_fts_projection_dirty_delete",
+    "sessions_fts_projection_dirty_update",
+)
+_PROJECTION_BASE_TRIGGERS = tuple(
+    name for name in _FTS_TRIGGERS if "_trigram_" not in name
+)
+_PROJECTION_TRIGRAM_TRIGGERS = tuple(
+    name for name in _FTS_TRIGGERS if "_trigram_" in name
+)
+_PROJECTION_SURFACE_KEYS = (
+    ("base", FTS_PROJECTION_PENDING_KEY, "messages_fts_docsize"),
+    ("trigram", FTS_TRIGRAM_PROJECTION_PENDING_KEY, "messages_fts_trigram_docsize"),
+    ("cjk", FTS_CJK_PROJECTION_PENDING_KEY, "messages_fts_cjk_docsize"),
+)
+
+
+def _projection_surface_key(pending: set) -> str:
+    return ",".join(name for name, key, _docsize in _PROJECTION_SURFACE_KEYS if key in pending)
+
+
+def _projection_old_indexed_sql(alias: str, docsize: str, marker: str) -> str:
+    """Snapshot only rows that really existed in a fenced FTS surface."""
+    return (
+        f"CASE WHEN EXISTS (SELECT 1 FROM state_meta WHERE key = '{marker}') "
+        f"AND EXISTS (SELECT 1 FROM {docsize} WHERE id = {alias}.id) "
+        "THEN 1 ELSE 0 END"
+    )
+
+
+_PROJECTION_DIRTY_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {_PROJECTION_DIRTY_TABLE} (
+    message_id INTEGER PRIMARY KEY,
+    old_indexed_content TEXT,
+    old_tool_name TEXT,
+    old_tool_calls TEXT,
+    old_role TEXT,
+    old_session_id TEXT,
+    old_trigram_eligible INTEGER NOT NULL DEFAULT 0,
+    old_base_indexed INTEGER NOT NULL DEFAULT 0,
+    old_trigram_indexed INTEGER NOT NULL DEFAULT 0,
+    old_cjk_indexed INTEGER NOT NULL DEFAULT 0,
+    base_replayed INTEGER NOT NULL DEFAULT 0,
+    trigram_replayed INTEGER NOT NULL DEFAULT 0,
+    cjk_replayed INTEGER NOT NULL DEFAULT 0,
+    base_snapshot TEXT,
+    trigram_snapshot TEXT,
+    cjk_snapshot TEXT
+)
+"""
+_PROJECTION_DIRTY_INSERT_SQL = f"""
+INSERT OR IGNORE INTO {_PROJECTION_DIRTY_TABLE}
+    (message_id, old_indexed_content, old_tool_name, old_tool_calls,
+     old_role, old_session_id, old_trigram_eligible,
+     old_base_indexed, old_trigram_indexed, old_cjk_indexed)
+VALUES (?, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0)
+"""
+_PROJECTION_DIRTY_OLD_SQL_TEMPLATE = f"""
+INSERT OR IGNORE INTO {_PROJECTION_DIRTY_TABLE}
+    (message_id, old_indexed_content, old_tool_name, old_tool_calls,
+     old_role, old_session_id, old_trigram_eligible,
+     old_base_indexed, old_trigram_indexed, old_cjk_indexed)
+VALUES (
+    OLD.id,
+    {_fts_indexed_content_sql('OLD')},
+    OLD.tool_name,
+    OLD.tool_calls,
+    OLD.role,
+    OLD.session_id,
+    CASE WHEN OLD.role <> 'tool' AND EXISTS (
+        SELECT 1 FROM sessions AS old_session
+        WHERE old_session.id = OLD.session_id
+          AND {fts_trigram_session_sql('old_session')}
+    ) THEN 1 ELSE 0 END,
+    {{base_indexed}},
+    {{trigram_indexed}},
+    {{cjk_indexed}}
+)
+"""
+
+
+def _projection_docsize_flag_sql(conn, alias: str, docsize: str, marker: str) -> str:
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (docsize,)
+    ).fetchone()
+    return _projection_old_indexed_sql(alias, docsize, marker) if exists else "0"
 
 
 def _is_cjk(cp: int) -> bool:
@@ -230,31 +345,31 @@ class SessionSearchMixin:
     # else is verbatim, and nothing consults a moving state_meta marker.
     _BOUNDARY_SWEEP_SQL = (
         "INSERT INTO {table}(rowid, content, tool_name, tool_calls) "
-        "SELECT m.id, m.content, m.tool_name, m.tool_calls FROM messages m WHERE m.id > ? AND m.id <= ? {extra}"
+        f"SELECT m.id, {_fts_indexed_content_sql('m')}, m.tool_name, m.tool_calls "
+        "FROM messages m WHERE m.id > ? AND m.id <= ? {extra}"
         "AND NOT EXISTS (SELECT 1 FROM {table}_docsize d WHERE d.id = m.id)"
     )
     _BASE_BOUNDARY_SWEEP_SQL = (
         "INSERT INTO messages_fts(rowid, content, tool_name, tool_calls) "
-        "SELECT m.id, CASE WHEN m.role = 'tool' THEN substr(COALESCE(m.content, ''), 1, ?) "
-        "ELSE m.content END, m.tool_name, m.tool_calls FROM messages m WHERE m.id > ? AND m.id <= ? "
+        f"SELECT m.id, {_fts_indexed_content_sql('m')}, m.tool_name, m.tool_calls "
+        "FROM messages m WHERE m.id > ? AND m.id <= ? "
         "AND NOT EXISTS (SELECT 1 FROM messages_fts_docsize d WHERE d.id = m.id)"
     )
     # Trigram excludes tool rows and FTS_TRIGRAM_EXCLUDED_SOURCES sessions; no tool_calls column.
     _TRIGRAM_BOUNDARY_SWEEP_SQL = (
         "INSERT INTO messages_fts_trigram(rowid, content, tool_name) "
-        "SELECT m.id, m.content, m.tool_name FROM messages m JOIN sessions s ON s.id = m.session_id "
+        f"SELECT m.id, {_fts_indexed_content_sql('m')}, m.tool_name FROM messages m JOIN sessions s ON s.id = m.session_id "
         f"WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' AND {fts_trigram_session_sql('s')} "
         "AND NOT EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = m.id)"
     )
     _CHUNK_INSERT_SQL = (
         "INSERT INTO {table}(rowid, content, tool_name, tool_calls) "
-        "SELECT id, CASE WHEN role = 'tool' "
-        f"THEN substr(COALESCE(content, ''), 1, {FTS_TOOL_CONTENT_PREFIX_CHARS}) "
-        "ELSE content END, tool_name, tool_calls FROM messages WHERE id > ? AND id <= ?{extra}"
+        f"SELECT id, {_fts_indexed_content_sql('messages')}, tool_name, tool_calls "
+        "FROM messages WHERE id > ? AND id <= ?{extra}"
     )
     _TRIGRAM_CHUNK_INSERT_SQL = (
         "INSERT INTO messages_fts_trigram(rowid, content, tool_name) "
-        "SELECT m.id, m.content, m.tool_name FROM messages m JOIN sessions s ON s.id = m.session_id "
+        f"SELECT m.id, {_fts_indexed_content_sql('m')}, m.tool_name FROM messages m JOIN sessions s ON s.id = m.session_id "
         f"WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' AND {fts_trigram_session_sql('s')}"
     )
 
@@ -278,14 +393,14 @@ class SessionSearchMixin:
 
     def _rebuild_finish(self, prefix: str, sweep_sqls: List[Tuple[str, bool]]) -> None:
         """Sweep a generous window around the high-water boundary, then clear the markers.
-        ``(sql, bounded)``: a bounded sweep takes the tool-content prefix_chars param first."""
+        ``(sql, bounded)``: *bounded* is retained for the caller's table-shape
+        bookkeeping; projection SQL now contains the full stable expression."""
         def _do(conn):
             hw_row = _meta_row(conn, f"{prefix}_high_water")
             if hw_row is not None:
                 hw = int(hw_row[0])
                 for sql, bounded in sweep_sqls:
-                    params = (FTS_TOOL_CONTENT_PREFIX_CHARS,) if bounded else ()
-                    conn.execute(sql, (*params, hw - 1000, hw + 1000))
+                    conn.execute(sql, (hw - 1000, hw + 1000))
             _delete_meta(conn, f"{prefix}_high_water", f"{prefix}_progress")
         self._execute_write(_do)
 
@@ -509,6 +624,500 @@ class SessionSearchMixin:
                 self._seed_fts_rebuild_markers(conn, force=True)
         self._execute_write(_do)
 
+    def _mark_projection_rebuilds_for_backfill(self) -> None:
+        """Fence projection writers and journal canonical changes before backfill."""
+        def _do(conn):
+            surfaces = (
+                ("messages_fts", FTS_PROJECTION_PENDING_KEY),
+                ("messages_fts_trigram", FTS_TRIGRAM_PROJECTION_PENDING_KEY),
+                ("messages_fts_cjk", FTS_CJK_PROJECTION_PENDING_KEY),
+            )
+            present = {
+                key for table, key in surfaces
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+                ).fetchone()
+            }
+            pending = self._projection_pending(conn)
+            started = _meta_row(conn, _PROJECTION_STARTED_KEY)
+            if started is None:
+                # Keep an already durable pending set from an older interrupted
+                # attempt; otherwise claim every surface that actually exists.
+                pending = pending or present
+                if not pending:
+                    return
+                self.set_meta(_PROJECTION_STARTED_KEY, "1", cursor=conn)
+                self.set_meta(_PROJECTION_SURFACES_KEY, _projection_surface_key(pending), cursor=conn)
+                self.set_meta(_PROJECTION_PROGRESS_KEY, "0", cursor=conn)
+                for key in pending:
+                    conn.execute(
+                        "INSERT INTO state_meta(key, value) VALUES(?, '1') "
+                        "ON CONFLICT(key) DO UPDATE SET value = '1'", (key,)
+                    )
+            elif not pending:
+                # The publication path owns cleanup and has already completed
+                # every surface.  A retry must not resurrect published routes.
+                return
+            else:
+                surface_key = _projection_surface_key(pending)
+                recorded = _meta_row(conn, _PROJECTION_SURFACES_KEY)
+                if recorded is None or recorded[0] != surface_key:
+                    self.set_meta(_PROJECTION_SURFACES_KEY, surface_key, cursor=conn)
+                    self.set_meta(_PROJECTION_PROGRESS_KEY, "0", cursor=conn)
+
+            conn.execute(_PROJECTION_DIRTY_TABLE_SQL)
+            columns = {
+                row[1] for row in conn.execute(
+                    f"PRAGMA table_info({_PROJECTION_DIRTY_TABLE})"
+                ).fetchall()
+            }
+            for column in (
+                "old_base_indexed", "old_trigram_indexed", "old_cjk_indexed",
+                "base_replayed", "trigram_replayed", "cjk_replayed",
+            ):
+                if column not in columns:
+                    conn.execute(
+                        f"ALTER TABLE {_PROJECTION_DIRTY_TABLE} "
+                        f"ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                    )
+
+            for surface in ("base", "trigram", "cjk"):
+                column = f"{surface}_snapshot"
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE {_PROJECTION_DIRTY_TABLE} ADD COLUMN {column} TEXT")
+
+            old_sql = _PROJECTION_DIRTY_OLD_SQL_TEMPLATE.format(
+                base_indexed=_projection_docsize_flag_sql(
+                    conn, "OLD", "messages_fts_docsize", FTS_PROJECTION_PENDING_KEY
+                ),
+                trigram_indexed=_projection_docsize_flag_sql(
+                    conn, "OLD", "messages_fts_trigram_docsize", FTS_TRIGRAM_PROJECTION_PENDING_KEY
+                ),
+                cjk_indexed=_projection_docsize_flag_sql(
+                    conn, "OLD", "messages_fts_cjk_docsize", FTS_CJK_PROJECTION_PENDING_KEY
+                ),
+            )
+            base_indexed = _projection_docsize_flag_sql(
+                conn, "m", "messages_fts_docsize", FTS_PROJECTION_PENDING_KEY
+            )
+            trigram_indexed = _projection_docsize_flag_sql(
+                conn, "m", "messages_fts_trigram_docsize", FTS_TRIGRAM_PROJECTION_PENDING_KEY
+            )
+            cjk_indexed = _projection_docsize_flag_sql(
+                conn, "m", "messages_fts_cjk_docsize", FTS_CJK_PROJECTION_PENDING_KEY
+            )
+            for name in _PROJECTION_DIRTY_TRIGGERS:
+                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            conn.execute(f"""
+                CREATE TRIGGER {_PROJECTION_DIRTY_TRIGGERS[0]}
+                AFTER INSERT ON messages
+                BEGIN
+                    INSERT OR IGNORE INTO {_PROJECTION_DIRTY_TABLE}
+                        (message_id, old_indexed_content, old_tool_name, old_tool_calls,
+                         old_role, old_session_id, old_trigram_eligible)
+                    VALUES (new.id, NULL, NULL, NULL, NULL, NULL, 0);
+                END
+            """)
+            conn.execute(f"""
+                CREATE TRIGGER {_PROJECTION_DIRTY_TRIGGERS[1]}
+                AFTER UPDATE OF content, fts_content, tool_name, tool_calls, role, session_id ON messages
+                WHEN old.content IS NOT new.content
+                  OR old.fts_content IS NOT new.fts_content
+                  OR old.tool_name IS NOT new.tool_name
+                  OR old.tool_calls IS NOT new.tool_calls
+                  OR old.role IS NOT new.role
+                  OR old.session_id IS NOT new.session_id
+                BEGIN
+                    {old_sql};
+                    UPDATE {_PROJECTION_DIRTY_TABLE}
+                    SET base_replayed = 0, trigram_replayed = 0, cjk_replayed = 0
+                    WHERE message_id = new.id;
+                END
+            """)
+            conn.execute(f"""
+                CREATE TRIGGER {_PROJECTION_DIRTY_TRIGGERS[2]}
+                AFTER DELETE ON messages
+                BEGIN
+                    {old_sql};
+                    UPDATE {_PROJECTION_DIRTY_TABLE}
+                    SET base_replayed = 0, trigram_replayed = 0, cjk_replayed = 0
+                    WHERE message_id = old.id;
+                END
+            """)
+            conn.execute(f"""
+                CREATE TRIGGER {_PROJECTION_DIRTY_TRIGGERS[3]}
+                AFTER UPDATE OF source, model_config ON sessions
+                WHEN old.source IS NOT new.source OR old.model_config IS NOT new.model_config
+                BEGIN
+                    INSERT OR IGNORE INTO {_PROJECTION_DIRTY_TABLE}
+                        (message_id, old_indexed_content, old_tool_name, old_tool_calls,
+                         old_role, old_session_id, old_trigram_eligible,
+                         old_base_indexed, old_trigram_indexed, old_cjk_indexed)
+                    SELECT m.id, {_fts_indexed_content_sql('m')}, m.tool_name, m.tool_calls,
+                           m.role, m.session_id,
+                           CASE WHEN m.role <> 'tool' AND {fts_trigram_session_sql('old')}
+                                THEN 1 ELSE 0 END,
+                           {base_indexed}, {trigram_indexed}, {cjk_indexed}
+                    FROM messages AS m
+                    WHERE m.session_id = old.id;
+                    UPDATE {_PROJECTION_DIRTY_TABLE}
+                    SET base_replayed = 0, trigram_replayed = 0, cjk_replayed = 0
+                    WHERE message_id IN (
+                        SELECT id FROM messages WHERE session_id = old.id
+                    );
+                END
+            """)
+            # Quarantine only still-pending families.  A published optional
+            # surface must keep its live writer triggers during a base retry.
+            if FTS_PROJECTION_PENDING_KEY in pending:
+                _drop_trigger_family(conn, _PROJECTION_BASE_TRIGGERS)
+            if FTS_TRIGRAM_PROJECTION_PENDING_KEY in pending:
+                _drop_trigger_family(conn, _PROJECTION_TRIGRAM_TRIGGERS)
+            if FTS_CJK_PROJECTION_PENDING_KEY in pending:
+                _drop_trigger_family(conn, _FTS_CJK_TRIGGERS)
+        self._execute_write(_do)
+
+    def _backfill_projection_content(self) -> None:
+        """Fill legacy rows in bounded, independently committed id slices."""
+        progress = 0
+        while True:
+            next_id = self._execute_write(
+                lambda conn: self._backfill_fts_content(conn, progress)
+            )
+            if next_id is None:
+                return
+            progress = next_id
+
+    @staticmethod
+    def _projection_pending(conn) -> set:
+        return {
+            row[0] for row in conn.execute(
+                "SELECT key FROM state_meta WHERE key IN (?, ?, ?)",
+                (FTS_PROJECTION_PENDING_KEY, FTS_TRIGRAM_PROJECTION_PENDING_KEY,
+                 FTS_CJK_PROJECTION_PENDING_KEY),
+            ).fetchall()
+        }
+
+    def _projection_surface_flags(self, conn, pending: set) -> Tuple[bool, bool, bool]:
+        """Return (base, trigram, cjk) surfaces that are both pending and present."""
+        exists = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, ?)",
+                ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"),
+            ).fetchall()
+        }
+        return (
+            FTS_PROJECTION_PENDING_KEY in pending and "messages_fts" in exists,
+            FTS_TRIGRAM_PROJECTION_PENDING_KEY in pending
+            and "messages_fts_trigram" in exists
+            and self._trigram_tokenizer_is_loadable(conn),
+            FTS_CJK_PROJECTION_PENDING_KEY in pending
+            and "messages_fts_cjk" in exists
+            and bool(getattr(self, "_fts_cjk_loaded", False)),
+        )
+
+    def _projection_seed_progress(self, conn) -> Tuple[int, int]:
+        pending = self._projection_pending(conn)
+        surface_key = _projection_surface_key(pending)
+        surface_row = _meta_row(conn, _PROJECTION_SURFACES_KEY)
+        progress_row = _meta_row(conn, _PROJECTION_PROGRESS_KEY)
+        if surface_row is None or surface_row[0] != surface_key:
+            self.set_meta(_PROJECTION_SURFACES_KEY, surface_key, cursor=conn)
+            self.set_meta(_PROJECTION_PROGRESS_KEY, "0", cursor=conn)
+            progress = 0
+        else:
+            progress = int(progress_row[0]) if progress_row is not None else 0
+            if progress_row is None:
+                self.set_meta(_PROJECTION_PROGRESS_KEY, "0", cursor=conn)
+        high_water_row = _meta_row(conn, _PROJECTION_HIGH_WATER_KEY)
+        if high_water_row is None:
+            high_water = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0])
+            self.set_meta(_PROJECTION_HIGH_WATER_KEY, str(high_water), cursor=conn)
+        else:
+            high_water = int(high_water_row[0])
+        return high_water, progress
+
+    def _projection_index_range(self, conn, lo: int, hi: int, *, base: bool, trigram: bool, cjk: bool) -> None:
+        """Index one bounded row-id range using the existing anti-join sweep SQL."""
+        if base:
+            conn.execute(self._BASE_BOUNDARY_SWEEP_SQL, (lo, hi))
+        if trigram:
+            conn.execute(self._TRIGRAM_BOUNDARY_SWEEP_SQL, (lo, hi))
+        if cjk:
+            conn.execute(
+                self._BOUNDARY_SWEEP_SQL.format(
+                    table="messages_fts_cjk", extra="AND m.role <> 'tool' "
+                ),
+                (lo, hi),
+            )
+
+    def _projection_reconcile_dirty(self, conn, progress: int, *, base: bool, trigram: bool, cjk: bool) -> bool:
+        """Replay one bounded batch before the forward anti-join scan."""
+        del progress  # replay decisions come from durable per-surface flags
+        pending = self._projection_pending(conn)
+        actionable = []
+        if base:
+            actionable.append("base_replayed = 0")
+        if trigram:
+            actionable.append("trigram_replayed = 0")
+        if cjk:
+            actionable.append("cjk_replayed = 0")
+        if not actionable:
+            return False
+        try:
+            dirty_rows = conn.execute(
+                f"SELECT message_id, old_indexed_content, old_tool_name, old_tool_calls, "
+                f"old_role, old_session_id, old_trigram_eligible, "
+                f"old_base_indexed, old_trigram_indexed, old_cjk_indexed, "
+                f"base_replayed, trigram_replayed, cjk_replayed, "
+                f"base_snapshot, trigram_snapshot, cjk_snapshot "
+                f"FROM {_PROJECTION_DIRTY_TABLE} "
+                f"WHERE {' OR '.join(actionable)} ORDER BY message_id LIMIT ?",
+                (self._FTS_REBUILD_CHUNK_ROWS,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return False
+        if not dirty_rows:
+            return False
+        for dirty in dirty_rows:
+            message_id = int(dirty[0])
+            current = conn.execute(
+                f"""
+                SELECT m.id, m.role, m.session_id, m.tool_name, m.tool_calls,
+                       {_fts_indexed_content_sql('m')} AS indexed_content,
+                       CASE WHEN m.role <> 'tool' AND EXISTS (
+                           SELECT 1 FROM sessions AS s
+                           WHERE s.id = m.session_id AND {fts_trigram_session_sql('s')}
+                       ) THEN 1 ELSE 0 END AS trigram_eligible
+                FROM messages AS m WHERE m.id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+            base_replayed = int(dirty[10] or 0)
+            trigram_replayed = int(dirty[11] or 0)
+            cjk_replayed = int(dirty[12] or 0)
+            snapshots = [json.loads(value) if value is not None else None for value in dirty[13:16]]
+
+            if base:
+                if not base_replayed:
+                    indexed = snapshots[0] or [int(dirty[7] or 0), dirty[1], dirty[2], dirty[3]]
+                    if indexed[0]:
+                        conn.execute(
+                            "INSERT INTO messages_fts(messages_fts, rowid, content, tool_name, tool_calls) "
+                            "VALUES ('delete', ?, ?, ?, ?)",
+                            (message_id, indexed[1], indexed[2], indexed[3]),
+                        )
+                    if current is not None:
+                        conn.execute(
+                            "INSERT INTO messages_fts(rowid, content, tool_name, tool_calls) VALUES (?, ?, ?, ?)",
+                            (current[0], current[5], current[3], current[4]),
+                        )
+                    snapshots[0] = ([1, current[5], current[3], current[4]]
+                                    if current is not None else [0, None, None, None])
+                    base_replayed = 1
+            elif FTS_PROJECTION_PENDING_KEY not in pending:
+                base_replayed = 1
+
+            if trigram:
+                if not trigram_replayed:
+                    indexed = snapshots[1] or [int(dirty[8] or 0), dirty[1], dirty[2], dirty[3]]
+                    if indexed[0]:
+                        conn.execute(
+                            "INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name) "
+                            "VALUES ('delete', ?, ?, ?)",
+                            (message_id, indexed[1], indexed[2]),
+                        )
+                    if current is not None and current[6]:
+                        conn.execute(
+                            "INSERT INTO messages_fts_trigram(rowid, content, tool_name) VALUES (?, ?, ?)",
+                            (current[0], current[5], current[3]),
+                        )
+                    snapshots[1] = ([1, current[5], current[3], current[4]]
+                                    if current is not None and current[6] else [0, None, None, None])
+                    trigram_replayed = 1
+            elif FTS_TRIGRAM_PROJECTION_PENDING_KEY not in pending:
+                trigram_replayed = 1
+
+            if cjk:
+                if not cjk_replayed:
+                    indexed = snapshots[2] or [int(dirty[9] or 0), dirty[1], dirty[2], dirty[3]]
+                    if indexed[0]:
+                        conn.execute(
+                            "INSERT INTO messages_fts_cjk(messages_fts_cjk, rowid, content, tool_name, tool_calls) "
+                            "VALUES ('delete', ?, ?, ?, ?)",
+                            (message_id, indexed[1], indexed[2], indexed[3]),
+                        )
+                    if current is not None and current[1] != "tool":
+                        conn.execute(
+                            "INSERT INTO messages_fts_cjk(rowid, content, tool_name, tool_calls) VALUES (?, ?, ?, ?)",
+                            (current[0], current[5], current[3], current[4]),
+                        )
+                    snapshots[2] = ([1, current[5], current[3], current[4]]
+                                    if current is not None and current[1] != "tool" else [0, None, None, None])
+                    cjk_replayed = 1
+            elif FTS_CJK_PROJECTION_PENDING_KEY not in pending:
+                cjk_replayed = 1
+
+            if (
+                (FTS_PROJECTION_PENDING_KEY not in pending or base_replayed)
+                and (FTS_TRIGRAM_PROJECTION_PENDING_KEY not in pending or trigram_replayed)
+                and (FTS_CJK_PROJECTION_PENDING_KEY not in pending or cjk_replayed)
+            ):
+                conn.execute(
+                    f"DELETE FROM {_PROJECTION_DIRTY_TABLE} WHERE message_id = ?", (message_id,)
+                )
+            else:
+                conn.execute(
+                    f"UPDATE {_PROJECTION_DIRTY_TABLE} SET base_replayed = ?, "
+                    "trigram_replayed = ?, cjk_replayed = ?, "
+                    "base_snapshot = ?, trigram_snapshot = ?, cjk_snapshot = ? WHERE message_id = ?",
+                    (base_replayed, trigram_replayed, cjk_replayed,
+                     *(json.dumps(value) if value is not None else None for value in snapshots), message_id),
+                )
+        return True
+
+    def _projection_has_actionable_dirty(self, conn) -> bool:
+        """Return whether queued work targets an available pending surface."""
+        pending = self._projection_pending(conn)
+        base, trigram, cjk = self._projection_surface_flags(conn, pending)
+        clauses = []
+        if base:
+            clauses.append("base_replayed = 0")
+        if trigram:
+            clauses.append("trigram_replayed = 0")
+        if cjk:
+            clauses.append("cjk_replayed = 0")
+        if not clauses:
+            return False
+        return conn.execute(
+            f"SELECT 1 FROM {_PROJECTION_DIRTY_TABLE} WHERE {' OR '.join(clauses)} LIMIT 1"
+        ).fetchone() is not None
+
+    def _projection_finalize_step(self) -> bool:
+        """Commit one dirty replay or one bounded projection range."""
+        def _do(conn):
+            pending = self._projection_pending(conn)
+            base, trigram, cjk = self._projection_surface_flags(conn, pending)
+            if not (base or trigram or cjk):
+                return False
+            high_water, progress = self._projection_seed_progress(conn)
+            current_high_water = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0])
+            if current_high_water > high_water:
+                high_water = current_high_water
+                self.set_meta(_PROJECTION_HIGH_WATER_KEY, str(high_water), cursor=conn)
+            # A dirty mutation may be ahead of the shared range.  Replay it
+            # first; the later anti-join will then safely skip its row.
+            if self._projection_reconcile_dirty(
+                conn, progress, base=base, trigram=trigram, cjk=cjk
+            ):
+                return True
+            if progress < high_water:
+                upper = min(progress + self._FTS_REBUILD_CHUNK_ROWS, high_water)
+                self._projection_index_range(conn, progress, upper, base=base, trigram=trigram, cjk=cjk)
+                self.set_meta(_PROJECTION_PROGRESS_KEY, str(upper), cursor=conn)
+                return True
+            return False
+        return bool(self._execute_write(_do))
+
+    def _projection_publish(self) -> Tuple[bool, bool]:
+        """Restore complete trigger families and clear only proven-complete fences.
+
+        Returns ``(published_any, required_base_is_still_pending)``.  Optional
+        tokenizer surfaces may remain durably pending and offline while the base
+        route is published.
+        """
+        def _do(conn):
+            pending = self._projection_pending(conn)
+            if not pending:
+                return False, False
+            high_water, progress = self._projection_seed_progress(conn)
+            if progress < high_water or self._projection_has_actionable_dirty(conn):
+                return False, FTS_PROJECTION_PENDING_KEY in pending
+            base, trigram, cjk = self._projection_surface_flags(conn, pending)
+            published = False
+            for enabled, table, ddl, key in (
+                (base, "messages_fts", FTS_SQL, FTS_PROJECTION_PENDING_KEY),
+                (trigram, "messages_fts_trigram", FTS_TRIGRAM_SQL, FTS_TRIGRAM_PROJECTION_PENDING_KEY),
+            ):
+                if enabled:
+                    if not self._ensure_fts_schema(conn, table, ddl):
+                        raise sqlite3.OperationalError("FTS unavailable during projection publication")
+                    _delete_meta(conn, key)
+                    published = True
+            if FTS_TRIGRAM_PROJECTION_PENDING_KEY in pending:
+                self._trigram_available = trigram
+                if not trigram:
+                    _drop_trigger_family(conn, _FTS_TRIGRAM_TRIGGERS)
+            if cjk:
+                _execute_ddl_script_transactional(conn, FTS_CJK_TRIGGER_SQL)
+                _delete_meta(conn, FTS_CJK_PROJECTION_PENDING_KEY)
+                self._fts_cjk_available = True
+                published = True
+            elif FTS_CJK_PROJECTION_PENDING_KEY in pending:
+                _drop_trigger_family(conn, _FTS_CJK_TRIGGERS)
+                self._fts_cjk_available = False
+            remaining = self._projection_pending(conn)
+            # The projection engine supersedes the old chunk engine for these
+            # surfaces; retaining its cursor would replay already-indexed rows.
+            if base:
+                _delete_meta(conn, "fts_rebuild_high_water", "fts_rebuild_progress")
+            if cjk:
+                _delete_meta(conn, "fts_cjk_rebuild_high_water", "fts_cjk_rebuild_progress")
+            if not remaining:
+                _drop_trigger_family(conn, _PROJECTION_DIRTY_TRIGGERS)
+                _delete_meta(conn, _PROJECTION_HIGH_WATER_KEY, _PROJECTION_PROGRESS_KEY,
+                             "fts_projection_started", "fts_projection_surfaces")
+                conn.execute(f"DROP TABLE IF EXISTS {_PROJECTION_DIRTY_TABLE}")
+                self.set_meta("fts_storage_version", str(FTS_STORAGE_VERSION), cursor=conn)
+            return published, FTS_PROJECTION_PENDING_KEY in remaining
+        return self._execute_write(_do)
+
+    def _finalize_projection_surfaces(self) -> bool:
+        """Finalize projections through restartable bounded chunks, never FTS5 ``rebuild``."""
+        while True:
+            pending = self._read_all(
+                "SELECT key FROM state_meta WHERE key IN (?, ?, ?)",
+                (FTS_PROJECTION_PENDING_KEY, FTS_TRIGRAM_PROJECTION_PENDING_KEY,
+                 FTS_CJK_PROJECTION_PENDING_KEY),
+            )
+            if not pending:
+                return True
+            started = time.monotonic()
+            if self._projection_finalize_step():
+                time.sleep(max(self._FTS_REBUILD_MIN_PAUSE,
+                               (time.monotonic() - started) * self._FTS_REBUILD_DUTY_FACTOR))
+                continue
+            published, base_pending = self._projection_publish()
+            if base_pending:
+                if not published:
+                    return False
+                continue
+            # A tokenizer-less optional surface remains durably fenced/offline,
+            # but it must not prevent the base route from settling.
+            return True
+
+    def _upgrade_projection_surfaces(self) -> None:
+        """Rebuild old source views, then resume the bounded column backfill."""
+        self._execute_write(
+            lambda conn: conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES('fts_optimize_available', '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'"
+            )
+        )
+        self._mark_projection_rebuilds_for_backfill()
+        with self._lock:
+            self._migrate_misaligned_fts_source(self._conn, legacy=self._db_has_legacy_inline_fts(self._conn))
+            if not self._fts_enabled:
+                raise sqlite3.OperationalError("projection migration admission deferred")
+            self._migrate_trigram_projection_source(self._conn)
+            if not self._fts_enabled:
+                raise sqlite3.OperationalError("projection migration admission deferred")
+            self._migrate_cjk_projection_source(self._conn)
+            self._conn.commit()
+        self._backfill_projection_content()
+        if not self._finalize_projection_surfaces():
+            raise sqlite3.OperationalError("projection finalization deferred")
+
     def fts_optimize_available(self) -> bool:
         """True when `optimize_fts_storage()` has work: legacy inline FTS or a v23 trigram still
         carrying ``tool_calls`` (``_db_needs_fts_storage_upgrade``), an interrupted optimize
@@ -576,7 +1185,15 @@ class SessionSearchMixin:
         *failure_message* without the base table (the backfill loop would retry forever)."""
         with self._lock:
             base_ok = self._ensure_fts_schema(self._conn, "messages_fts", FTS_SQL)
-            trigram_ok = self._ensure_fts_schema(self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL)
+            trigram_pending = self._conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?", (FTS_TRIGRAM_PROJECTION_PENDING_KEY,)
+            ).fetchone() is not None
+            trigram_ok = (
+                False if trigram_pending
+                else self._ensure_fts_schema(self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL)
+            )
+            if trigram_pending:
+                _drop_trigger_family(self._conn, _FTS_TRIGRAM_TRIGGERS)
             self._trigram_available = bool(trigram_ok)
             if not base_ok:
                 raise sqlite3.OperationalError(failure_message)
@@ -618,6 +1235,16 @@ class SessionSearchMixin:
             return "teardown_incomplete"
         if self._fts_external_index_empty_with_messages(conn):
             return "backfill_incomplete"
+        pending = self._projection_pending(conn)
+        if pending:
+            if FTS_PROJECTION_PENDING_KEY in pending or any(self._projection_surface_flags(conn, pending)):
+                return "projection_incomplete"
+            return None
+        if any(
+            self._fts_view_needs_projection(conn, view)
+            for view in ("messages_fts_src", "messages_fts_trigram_src", "messages_fts_cjk_src")
+        ):
+            return "projection_incomplete"
         self.set_meta("fts_storage_version", str(FTS_STORAGE_VERSION), cursor=conn)
         _delete_meta(conn, "fts_optimize_available")
         conn.execute("UPDATE schema_version SET version = ? WHERE version < ?", (SCHEMA_VERSION, SCHEMA_VERSION))
@@ -639,8 +1266,18 @@ class SessionSearchMixin:
         self._repair_optimize_bookkeeping()
         with self._lock:
             needs_storage_upgrade = self._db_needs_fts_storage_upgrade(self._conn)
+            legacy_layout = self._db_has_legacy_inline_fts(self._conn)
+            projection_pending = self._conn.execute(
+                "SELECT 1 FROM state_meta WHERE key IN (?, ?, ?) LIMIT 1",
+                (FTS_PROJECTION_PENDING_KEY, FTS_TRIGRAM_PROJECTION_PENDING_KEY,
+                 FTS_CJK_PROJECTION_PENDING_KEY),
+            ).fetchone() is not None
+            deferred_projection = (
+                not legacy_layout
+                and (projection_pending or _meta_row(self._conn, "fts_optimize_available") is not None)
+            )
         pending = self.get_meta("fts_rebuild_high_water") is not None
-        if needs_storage_upgrade and not pending:
+        if needs_storage_upgrade and not pending and not deferred_projection:
             self._demote_legacy_fts_to_trash()
         elif pending and not needs_storage_upgrade:
             # Resume mid-demote: the process may have died between the staged demote
@@ -652,6 +1289,10 @@ class SessionSearchMixin:
         self._fts_cjk_reset_if_stale()
         if self._fts_cjk_loaded:
             self._ensure_cjk_schema_committed()
+        with self._lock:
+            projection_pending = bool(self._projection_pending(self._conn))
+        if needs_storage_upgrade or projection_pending:
+            self._upgrade_projection_surfaces()
 
         def _emit(phase: str) -> None:
             if progress_cb is None:
@@ -993,16 +1634,67 @@ class SessionSearchMixin:
                                order_by=f"ORDER BY m.timestamp {order}, m.id {order}", limit_sql="LIMIT ? OFFSET ?")
 
     def _refresh_fts_stale_state(self) -> None:
-        """Observe fail-open initiated by another process sharing state.db."""
-        if self._fts_stale or not self._fts_enabled:
+        """Observe durable stale/projection state from an already-open peer.
+
+        Projection markers are a writer fence as well as a migration breadcrumb:
+        an open handle must stop routing immediately, and may only republish an
+        optional route after a sibling has durably cleared the marker and restored
+        the complete trigger family.
+        """
+        if not self._fts_enabled and not getattr(self, "_fts_projection_quarantined", False):
             return
         try:
-            stale = self._read_one("SELECT 1 FROM state_meta WHERE key = ? LIMIT 1", (FTS_STALE_KEY,))
+            rows = self._read_all(
+                "SELECT key FROM state_meta WHERE key IN (?, ?, ?, ?)",
+                (FTS_STALE_KEY, FTS_PROJECTION_PENDING_KEY,
+                 FTS_TRIGRAM_PROJECTION_PENDING_KEY, FTS_CJK_PROJECTION_PENDING_KEY),
+            )
         except sqlite3.Error:
             return
-        if stale is not None:
+        state = {row[0] for row in rows}
+        pending = state.intersection({
+            FTS_PROJECTION_PENDING_KEY,
+            FTS_TRIGRAM_PROJECTION_PENDING_KEY,
+            FTS_CJK_PROJECTION_PENDING_KEY,
+        })
+        if FTS_STALE_KEY in state or pending:
+            if pending:
+                self._fts_projection_quarantined = True
+            self._fts_stale = True
+            self._trigram_available = self._fts_cjk_available = False
+            return
+        if not getattr(self, "_fts_projection_quarantined", False):
+            return
+
+        # A sibling completed the fenced swap.  Only restore in-memory routing
+        # from already durable objects/triggers; never rebuild from a search read.
+        try:
+            base_ok = self._fts_table_probe(self._conn.cursor(), "messages_fts") is True
+            tri_names = tuple(name for name in _FTS_TRIGGERS if "_trigram_" in name)
+            base_names = tuple(name for name in _FTS_TRIGGERS if name not in tri_names)
+            trigger_names = {
+                row[0] for row in self._read_all(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'",
+                    (),
+                )
+            }
+            self._fts_enabled = base_ok and set(base_names).issubset(trigger_names)
+            self._trigram_available = (
+                self._fts_enabled
+                and self._fts_table_probe(self._conn.cursor(), "messages_fts_trigram") is True
+                and set(tri_names).issubset(trigger_names)
+            )
+            self._fts_cjk_available = (
+                self._fts_enabled and getattr(self, "_fts_cjk_loaded", False)
+                and self._fts_table_probe(self._conn.cursor(), "messages_fts_cjk") is True
+                and set(_FTS_CJK_TRIGGERS).issubset(trigger_names)
+            )
+        except sqlite3.Error:
             self._fts_stale = True
             self._fts_enabled = self._trigram_available = self._fts_cjk_available = False
+            return
+        self._fts_stale = not self._fts_enabled
+        self._fts_projection_quarantined = False
 
     def _finalize_search_matches(
         self, matches: List[Dict[str, Any]], result_fields: Optional[Collection[str]] = None) -> List[Dict[str, Any]]:

@@ -270,6 +270,7 @@ class GatewayGoalsMixin:
 
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str,
+        response_already_delivered: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
@@ -300,9 +301,13 @@ class GatewayGoalsMixin:
             ),
         )
         msg = decision.get("message") or ""
-        # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
+        # Defer until the visible final response is delivered, except when streaming already
+        # delivered the body and no later adapter post-delivery callback will fire.
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            if response_already_delivered:
+                await self._send_goal_status_notice(source, msg)
+            else:
+                await self._defer_goal_status_notice_after_delivery(source, msg)
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
             return
@@ -320,6 +325,11 @@ class GatewayGoalsMixin:
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
+        response_already_delivered = bool(getattr(event, "_streamed_final_response", None))
+        if isinstance(agent_result, dict):
+            response_already_delivered = response_already_delivered or (
+                bool(agent_result.get("already_sent")) and not bool(agent_result.get("failed"))
+            )
         try:
             session_entry = await self.async_session_store.get_or_create_session(
                 source, touch_activity=not is_internal,
@@ -329,12 +339,19 @@ class GatewayGoalsMixin:
             return
         # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
-        hooks = [("loop completion", self._post_turn_loop_completion)]
+        hooks = [("loop completion", self._post_turn_loop_completion, {})]
         if final_text.strip():
-            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
-        for label, hook in hooks:
+            hooks.insert(
+                0,
+                (
+                    "goal continuation",
+                    self._post_turn_goal_continuation,
+                    {"response_already_delivered": response_already_delivered},
+                ),
+            )
+        for label, hook, kwargs in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                await hook(session_entry=session_entry, source=source, final_response=final_text, **kwargs)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
 

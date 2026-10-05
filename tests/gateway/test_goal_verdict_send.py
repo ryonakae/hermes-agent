@@ -70,6 +70,15 @@ class _RecordingAdapter:
         return _R()
 
 
+class _CallbackRecordingAdapter(_RecordingAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.callbacks: dict = {}
+
+    def register_post_delivery_callback(self, session_key, callback, *, generation=None):
+        self.callbacks[session_key] = (generation, callback)
+
+
 def _make_runner_with_adapter(session_id: str = None):
     from gateway.run import GatewayRunner
     import uuid
@@ -172,5 +181,71 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     assert "turns used" in content.lower()
     # No continuation enqueued when budget is exhausted
     assert not adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_goal_verdict_streamed_done_sends_status_immediately(hermes_home):
+    """A streamed body has already landed, so its goal status cannot wait for a later send callback."""
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    adapter = _CallbackRecordingAdapter()
+    runner.adapters[Platform.TELEGRAM] = adapter
+
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("ship the feature")
+
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("done", "the feature shipped", False, None, False),
+    ):
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="I shipped the feature.",
+            response_already_delivered=True,
+        )
+
+    assert len(adapter.sends) == 1
+    assert "Goal achieved" in adapter.sends[0]["content"]
+    assert adapter.callbacks == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streamed", [True, False])
+async def test_post_turn_hooks_deliver_goal_notice_after_body(hermes_home, streamed):
+    from types import SimpleNamespace
+    from hermes_cli.goals import GoalManager
+
+    runner, _, session_entry, src = _make_runner_with_adapter()
+    adapter = _CallbackRecordingAdapter()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    GoalManager(session_entry.session_id).set("ship the feature")
+    body = "I shipped the feature."
+    event = SimpleNamespace(_streamed_final_response=body if streamed else None)
+    if streamed:
+        await adapter.send(src.chat_id, body)
+
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("done", "the feature shipped", False, None, False),
+    ):
+        await runner._run_post_turn_hooks(
+            agent_result=None if streamed else body,
+            source=src, is_internal=False, event=event,
+        )
+
+    if streamed:
+        assert adapter.callbacks == {}
+    else:
+        assert adapter.sends == []
+        assert len(adapter.callbacks) == 1
+        await adapter.send(src.chat_id, body)
+        _, callback = adapter.callbacks.pop(build_session_key(src))
+        await callback()
+
+    assert len(adapter.sends) == 2
+    assert adapter.sends[0]["content"] == body
+    assert "Goal achieved" in adapter.sends[1]["content"]
+    assert adapter.callbacks == {}
 
 

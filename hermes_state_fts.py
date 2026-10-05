@@ -10,12 +10,32 @@ from pathlib import Path
 from typing import Sequence
 
 from hermes_constants import get_hermes_home
-from hermes_state_common import (FTS_CJK_STALE_KEY, FTS_STALE_KEY, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS,
-    routed_sessions_setting)
+from hermes_state_common import (
+    FTS_CJK_PROJECTION_PENDING_KEY, FTS_CJK_STALE_KEY, FTS_PROJECTION_PENDING_KEY,
+    FTS_STALE_KEY, FTS_TRIGRAM_PROJECTION_PENDING_KEY, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS,
+    _FTS_NEW_INDEXED_CONTENT_SQL, _FTS_OLD_INDEXED_CONTENT_SQL, _fts_indexed_content_sql,
+    routed_sessions_setting,
+)
 from hermes_state_errors import is_fts_scoped_corruption_error, is_sqlite_lock_error
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
+
+_FTS_BASE_TRIGGERS = tuple(name for name in _FTS_TRIGGERS if "_trigram_" not in name)
+_FTS_TRIGRAM_TRIGGERS = tuple(name for name in _FTS_TRIGGERS if "_trigram_" in name)
+
+
+def _execute_ddl_script_transactional(cursor: sqlite3.Cursor, ddl: str) -> None:
+    """Execute a multi-statement DDL script without ``executescript``'s implicit commit."""
+    statement = ""
+    for line in ddl.splitlines():
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            cursor.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise sqlite3.OperationalError("incomplete FTS DDL statement")
+
 
 # ── CJK-bigram FTS index (replaces the trigram index when available) ────
 # Trigram needs >=3 chars per term, so 1-2 char CJK terms fell through to a LIKE
@@ -37,10 +57,10 @@ logger = logging.getLogger("hermes_state")
 # as overlapping character bigrams (Lucene CJKAnalyzer semantics), everything else passes through unchanged.
 # FTS5 phrase semantics turn a query term's consecutive bigrams into exact substring matching down to 2
 # chars at index speed. Contributed by Soju06 (PR #65544).
-FTS_CJK_TABLE_SQL = """
+FTS_CJK_TABLE_SQL = f"""
 CREATE VIEW IF NOT EXISTS messages_fts_cjk_src AS
-    SELECT id, role, content, tool_name, tool_calls
-    FROM messages
+    SELECT m.id, m.role, {_fts_indexed_content_sql('m')} AS content, m.tool_name, m.tool_calls
+    FROM messages AS m
     WHERE role <> 'tool';
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_cjk USING fts5(
@@ -53,7 +73,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_cjk USING fts5(
 );
 """
 
-FTS_CJK_TRIGGER_SQL = """
+FTS_CJK_TRIGGER_SQL = f"""
 CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_insert AFTER INSERT ON messages
 WHEN new.role <> 'tool'
    AND (new.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
@@ -62,7 +82,7 @@ WHEN new.role <> 'tool'
                             WHERE key = 'fts_cjk_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_cjk(rowid, content, tool_name, tool_calls)
-    VALUES (new.id, new.content, new.tool_name, new.tool_calls);
+    VALUES (new.id, {_FTS_NEW_INDEXED_CONTENT_SQL}, new.tool_name, new.tool_calls);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_delete AFTER DELETE ON messages
@@ -73,12 +93,13 @@ WHEN old.role <> 'tool'
                             WHERE key = 'fts_cjk_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_cjk(messages_fts_cjk, rowid, content, tool_name, tool_calls)
-    VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
+    VALUES ('delete', old.id, {_FTS_OLD_INDEXED_CONTENT_SQL}, old.tool_name, old.tool_calls);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_update
-AFTER UPDATE OF content, tool_name, tool_calls, role ON messages
+AFTER UPDATE OF content, fts_content, tool_name, tool_calls, role ON messages
 WHEN (old.content IS NOT new.content
+    OR old.fts_content IS NOT new.fts_content
     OR old.tool_name IS NOT new.tool_name
     OR old.tool_calls IS NOT new.tool_calls
     OR old.role IS NOT new.role)
@@ -88,10 +109,10 @@ WHEN (old.content IS NOT new.content
                             WHERE key = 'fts_cjk_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_cjk(messages_fts_cjk, rowid, content, tool_name, tool_calls)
-    SELECT 'delete', old.id, old.content, old.tool_name, old.tool_calls
+    SELECT 'delete', old.id, {_FTS_OLD_INDEXED_CONTENT_SQL}, old.tool_name, old.tool_calls
     WHERE old.role <> 'tool';
     INSERT INTO messages_fts_cjk(rowid, content, tool_name, tool_calls)
-    SELECT new.id, new.content, new.tool_name, new.tool_calls
+    SELECT new.id, {_FTS_NEW_INDEXED_CONTENT_SQL}, new.tool_name, new.tool_calls
     WHERE new.role <> 'tool';
 END;
 """
@@ -168,6 +189,58 @@ def _drop_orphan_fts_shadow_tables(cursor: sqlite3.Cursor, families: Sequence[st
     return repaired
 
 
+def _drop_trigger_family(cursor: sqlite3.Cursor, names: Sequence[str]) -> None:
+    """Drop a trigger family and fail closed if SQLite left any member behind."""
+    failures = []
+    for trigger in names:
+        try:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        except sqlite3.Error as exc:
+            failures.append((trigger, exc))
+    placeholders = ",".join("?" for _ in names)
+    survivors = [row[0] for row in cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+        f"AND name IN ({placeholders})", tuple(names)
+    ).fetchall()]
+    if failures or survivors:
+        detail = ", ".join(name for name, _exc in failures) or ", ".join(survivors)
+        raise sqlite3.OperationalError(f"failed to quarantine FTS triggers: {detail}")
+
+
+def _quarantine_trigger_family(cursor: sqlite3.Cursor, marker_key: str, names: Sequence[str]) -> None:
+    """Persist a quarantine marker and detach its triggers atomically."""
+    conn = getattr(cursor, "connection", cursor)
+    owns_transaction = not conn.in_transaction
+    savepoint = f"fts_quarantine_{id(cursor):x}"
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        # The caller may already be inside schema setup.  A plain nested write
+        # would leave the marker committed in the caller's transaction when a
+        # later DROP fails, so fence this helper with its own savepoint.
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        cursor.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'",
+            (marker_key,),
+        )
+        _drop_trigger_family(cursor, names)
+        if owns_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except BaseException:
+        if owns_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
 class SessionFtsSetupMixin:
     """FTS table/trigger lifecycle shared by schema init, optimize and the write path."""
 
@@ -211,7 +284,39 @@ class SessionFtsSetupMixin:
     @classmethod
     def _db_needs_fts_storage_upgrade(cls, cursor: sqlite3.Cursor) -> bool:
         """True when the current FTS storage layout should be treated as stale (optimize-storage has work)."""
-        return cls._db_has_legacy_inline_fts(cursor) or cls._db_has_trigram_tool_calls_projection(cursor)
+        if cls._db_has_legacy_inline_fts(cursor) or cls._db_has_trigram_tool_calls_projection(cursor):
+            return True
+        if cursor.execute(
+            "SELECT 1 FROM state_meta WHERE key IN (?, ?, ?, ?) LIMIT 1",
+            (FTS_PROJECTION_PENDING_KEY, FTS_TRIGRAM_PROJECTION_PENDING_KEY,
+             FTS_CJK_PROJECTION_PENDING_KEY, "fts_optimize_available"),
+        ).fetchone():
+            return True
+        for view_name in ("messages_fts_src", "messages_fts_trigram_src", "messages_fts_cjk_src"):
+            row = cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = ?", (view_name,)
+            ).fetchone()
+            if row is not None and "fts_content" not in (row[0] or "").lower():
+                return True
+        return False
+
+    @staticmethod
+    def _trigram_tokenizer_is_loadable(conn: sqlite3.Connection) -> bool:
+        """Probe replacement trigram DDL without touching the durable surface."""
+        probe = "__hermes_trigram_projection_probe"
+        try:
+            conn.execute(
+                f"CREATE VIRTUAL TABLE temp.{probe} USING fts5(content, tokenize='trigram')"
+            )
+            return True
+        except sqlite3.DatabaseError as exc:
+            logger.warning("Trigram tokenizer probe failed; deferring projection migration: %s", exc)
+            return False
+        finally:
+            try:
+                conn.execute(f"DROP TABLE IF EXISTS temp.{probe}")
+            except sqlite3.DatabaseError:
+                pass
 
     def _warn_trigram_unavailable(self, exc: sqlite3.OperationalError) -> None:
         """Log once that the trigram tokenizer is missing; base FTS5 stays enabled."""
@@ -250,33 +355,13 @@ class SessionFtsSetupMixin:
             cjk_present = bool(cursor.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts_cjk'"
             ).fetchone())
+            live = []
             if not self._fts_cjk_loaded:
-                if cjk_present:
-                    live = [r[0] for r in cursor.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
-                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
-                        _FTS_CJK_TRIGGERS,
-                    ).fetchall()]
-                    if live:
-                        # Breadcrumb FIRST (a crash between the two is merely conservative).
-                        logger.warning(
-                            "messages_fts_cjk triggers present but the "
-                            "cjk_unicode61 tokenizer is unavailable (%s) — "
-                            "dropping the cjk triggers so message writes keep "
-                            "working. CJK search falls back to trigram/LIKE; "
-                            "run `hermes sessions optimize-storage` on a host "
-                            "with the extension to rebuild.",
-                            fts5_cjk_so_path(),
-                        )
-                        cursor.execute(
-                            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                            "ON CONFLICT(key) DO UPDATE SET value = '1'",
-                            (FTS_CJK_STALE_KEY,),
-                        )
-                        for trig in live:
-                            cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
-                self._fts_cjk_available = False
-                return
+                live = [r[0] for r in cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)})",
+                    _FTS_CJK_TRIGGERS,
+                ).fetchall()]
         except sqlite3.OperationalError:
             logger.warning(
                 "messages_fts_cjk presence check failed; CJK search stays on "
@@ -284,8 +369,22 @@ class SessionFtsSetupMixin:
             )
             self._fts_cjk_available = False
             return
+        if not self._fts_cjk_loaded:
+            if live:
+                logger.warning(
+                    "messages_fts_cjk triggers present but the "
+                    "cjk_unicode61 tokenizer is unavailable (%s) — "
+                    "dropping the cjk triggers so message writes keep "
+                    "working. CJK search falls back to trigram/LIKE; "
+                    "run `hermes sessions optimize-storage` on a host "
+                    "with the extension to rebuild.",
+                    fts5_cjk_so_path(),
+                )
+                _quarantine_trigger_family(cursor, FTS_CJK_STALE_KEY, _FTS_CJK_TRIGGERS)
+            self._fts_cjk_available = False
+            return
         try:
-            cursor.executescript(FTS_CJK_TABLE_SQL)
+            _execute_ddl_script_transactional(cursor, FTS_CJK_TABLE_SQL)
             if not cjk_present:
                 # An old stale breadcrumb refers to a table that no longer exists.
                 cursor.execute("DELETE FROM state_meta WHERE key = ?", (FTS_CJK_STALE_KEY,))
@@ -305,7 +404,14 @@ class SessionFtsSetupMixin:
                 # Gap of unknown extent: do NOT reinstall triggers (see module comment).
                 self._fts_cjk_available = False
                 return
-            cursor.executescript(FTS_CJK_TRIGGER_SQL)
+            if cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?", (FTS_CJK_PROJECTION_PENDING_KEY,)
+            ).fetchone():
+                # Projection migration owns trigger publication.  A crash or
+                # tokenizer/DDL failure must never leave a partial CJK route live.
+                self._fts_cjk_available = False
+                return
+            _execute_ddl_script_transactional(cursor, FTS_CJK_TRIGGER_SQL)
             backfill_pending = cursor.execute(
                 "SELECT 1 FROM state_meta WHERE key = 'fts_cjk_rebuild_high_water' LIMIT 1"
             ).fetchone()
@@ -318,12 +424,28 @@ class SessionFtsSetupMixin:
             self._fts_cjk_available = False
 
     @staticmethod
+    def _drop_trigger_family(cursor: sqlite3.Cursor, names: Sequence[str]) -> None:
+        _drop_trigger_family(cursor, names)
+
+    def _quarantine_pending_projection_triggers(self, cursor: sqlite3.Cursor) -> None:
+        """Honor durable projection markers on every writer handle."""
+        pending = {
+            row[0] for row in cursor.execute(
+                "SELECT key FROM state_meta WHERE key IN (?, ?, ?)",
+                (FTS_PROJECTION_PENDING_KEY, FTS_TRIGRAM_PROJECTION_PENDING_KEY,
+                 FTS_CJK_PROJECTION_PENDING_KEY),
+            ).fetchall()
+        }
+        if FTS_PROJECTION_PENDING_KEY in pending:
+            self._drop_trigger_family(cursor, _FTS_TRIGGERS)
+        elif FTS_TRIGRAM_PROJECTION_PENDING_KEY in pending:
+            self._drop_trigger_family(cursor, _FTS_TRIGRAM_TRIGGERS)
+        if FTS_CJK_PROJECTION_PENDING_KEY in pending:
+            self._drop_trigger_family(cursor, _FTS_CJK_TRIGGERS)
+
+    @staticmethod
     def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:
-        for trigger in _FTS_TRIGGERS:
-            try:
-                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-            except sqlite3.OperationalError:
-                pass
+        SessionFtsSetupMixin._drop_trigger_family(cursor, _FTS_TRIGGERS)
 
     def _ensure_fts_schema(self, cursor: sqlite3.Cursor, table_name: str, ddl: str) -> bool:
         status = self._fts_table_probe(cursor, table_name)
@@ -331,7 +453,7 @@ class SessionFtsSetupMixin:
             return False
         try:
             # Run even when the table exists: recreates triggers a no-FTS5 runtime dropped.
-            cursor.executescript(ddl)
+            _execute_ddl_script_transactional(cursor, ddl)
             return True
         except sqlite3.OperationalError as exc:
             if not self._is_fts5_unavailable_error(exc):
