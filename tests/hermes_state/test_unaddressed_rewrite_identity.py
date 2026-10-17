@@ -83,3 +83,39 @@ def test_fresh_identical_message_is_never_adopted_by_payload(db):
     assert db.append_messages_batch(sid, [second]) == 1
 
     assert len(_active_rows(db, sid)) == 2
+
+
+def test_rewritten_multimodal_replay_is_searchable_by_its_new_text(db):
+    sid = "multimodal-rewrite"
+    db.create_session(sid, "desktop")
+    original = {"role": "assistant", "content": [{"type": "text", "text": "zebracornflake"}], "timestamp": 4000.0}
+    assert db.append_messages_batch(sid, [original]) == 1
+
+    restored = db.get_messages_as_conversation(sid, repair_alternation=True)
+    restored[0]["content"] = [{"type": "text", "text": "quokkalantern"}]
+    restored[0].pop(_DB_PERSISTED_MARKER, None)
+
+    assert db.append_messages_batch(sid, restored) == 0
+
+    assert db.search_messages("quokkalantern", limit=10)
+    assert not db.search_messages("zebracornflake", limit=10)
+
+
+def test_fts_backfill_between_replay_and_flush_keeps_the_live_edit(db):
+    """The bounded FTS backfill fills historical rows' projection without touching content: it is not a
+    foreign payload winner, so the replayed dict's edit must still be written."""
+    sid = "backfill-race"
+    db.create_session(sid, "desktop")
+    original = {"role": "assistant", "content": [{"type": "text", "text": "before backfill"}], "timestamp": 5000.0}
+    assert db.append_messages_batch(sid, [original]) == 1
+    db._conn.execute("UPDATE messages SET fts_content = NULL WHERE session_id = ?", (sid,))
+    db._conn.commit()
+
+    restored = db.get_messages_as_conversation(sid, repair_alternation=True)
+    db._backfill_fts_content(db._conn.cursor())
+    db._conn.commit()
+    restored[0]["content"] = [{"type": "text", "text": "after backfill"}]
+    restored[0].pop(_DB_PERSISTED_MARKER, None)
+
+    assert db.append_messages_batch(sid, restored) == 0
+    assert db.get_messages_as_conversation(sid)[0]["content"] == [{"type": "text", "text": "after backfill"}]

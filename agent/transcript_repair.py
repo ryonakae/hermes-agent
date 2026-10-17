@@ -27,8 +27,11 @@ _REPAIR_COLUMNS = tuple(c for c in _MESSAGE_WRITE_COLUMNS if c not in _NON_PAYLO
 # Columns same-process writers update after our flush (reactions / display-kind stamps, api_content
 # backfill, codex reasoning backfill + checkpoint pruning, platform message ids). They are not part of the
 # ownership version: a metadata write must never make our own row look like a foreign winner.
+# ``fts_content`` is derived from ``content`` and the bounded FTS backfill fills it on its own; conversation
+# projections never select it, so it must stay out of the digest.
 _METADATA_COLUMNS = frozenset(
-    {"display_kind", "display_metadata", "api_content", "codex_reasoning_items", "platform_message_id"}
+    {"display_kind", "display_metadata", "api_content", "codex_reasoning_items", "platform_message_id",
+     "fts_content"}
 )
 # The ownership version: what we last committed for the payload the sanitizer / live edits change.
 _OWNED_COLUMNS = tuple(c for c in _REPAIR_COLUMNS if c not in _METADATA_COLUMNS)
@@ -223,11 +226,13 @@ def _rewrite_row(
         ).fetchall()
     ] if old_identity is not None else []
 
-    # Owned columns only: same-process metadata writes (a reaction, a backfill) stay as committed.
-    assignments = ", ".join(f"{column} = ?" for column in _OWNED_COLUMNS)
+    # Owned columns only: same-process metadata writes (a reaction, a backfill) stay as committed. The FTS
+    # projection still follows the rewritten content, or search keeps matching the replaced text.
+    columns = (*_OWNED_COLUMNS, "fts_content")
+    assignments = ", ".join(f"{column} = ?" for column in columns)
     conn.execute(
         f"UPDATE messages SET {assignments} WHERE id = ? AND session_id = ?",
-        [*(serialized[column] for column in _OWNED_COLUMNS), int(target_row["id"]), session_id],
+        [*(serialized[column] for column in columns), int(target_row["id"]), session_id],
     )
     _restore_display_index(conn, session_id, target_row, serialized, old_identity, old_peer_ids)
 
