@@ -247,7 +247,7 @@ class TestSendFinalization:
             assert not adapter._active_streams
         else:
             client.chat_stopStream.assert_not_awaited()
-            assert adapter._active_streams["D1"]["ts"] == draft.message_id
+            assert next(iter(adapter._active_streams.values()))["ts"] == draft.message_id
 
     @pytest.mark.asyncio
     async def test_final_send_seals_stream_no_duplicate_post(self):
