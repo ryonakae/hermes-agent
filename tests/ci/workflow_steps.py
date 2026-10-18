@@ -6,6 +6,7 @@ with argv receipts. No setup actions, installs, E2E tests or native hosts run he
 from __future__ import annotations
 
 import fnmatch
+import functools
 import json
 import os
 import subprocess
@@ -64,6 +65,24 @@ def _interpreter_dirs(root: Path) -> tuple[str, ...]:
     return str(interpreter), str(shims)
 
 
+@functools.cache
+def _replay_bash() -> str:
+    """The first Bash on PATH that runs the steps as GitHub's runners (Bash 5) do; macOS's
+    /bin/bash 3.2 lacks builtins the steps use (``mapfile``)."""
+    candidates = (locate_command("bash").command[0],
+                  *(os.path.join(entry, "bash") for entry in os.environ.get("PATH", "").split(os.pathsep) if entry))
+    for bash in dict.fromkeys(candidates):
+        if not os.access(bash, os.X_OK):
+            continue
+        probe = subprocess.run([bash, "--noprofile", "--norc", "-c", "echo ${BASH_VERSINFO[0]}"],
+                               capture_output=True, text=True, timeout=10, check=False)
+        if probe.returncode == 0 and probe.stdout.strip().isdigit() and int(probe.stdout) >= 4:
+            return bash
+    import pytest  # local: replay subprocesses import this module without pytest installed
+
+    pytest.skip("replaying workflow steps needs Bash 4+ on PATH (GitHub's runners ship Bash 5)")
+
+
 def _run(step: dict, ctx: dict, cwd: Path | None = None, *, receipt: bool = False) -> tuple[dict, list]:
     required(step, ctx)
     assert step.get("shell", "bash") == "bash", "only safe Bash selection steps are replayed"
@@ -72,7 +91,7 @@ def _run(step: dict, ctx: dict, cwd: Path | None = None, *, receipt: bool = Fals
         output, calls = root / "outputs", root / "calls"
         output.touch()
         calls.touch()
-        bash = locate_command("bash").command[0]
+        bash = _replay_bash()
         # Steps call git too. Linux reaches it through os.defpath; on Windows the bash found
         # first may be Git's usr\bin (no git.exe), so git's own dir rides along like bash's.
         git = locate_command("git").command[0]
