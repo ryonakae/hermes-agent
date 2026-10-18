@@ -250,7 +250,8 @@ class Python(_BionicDebArm, BinaryPackage, DebPackage):
     def stage(self, store: Store, staged: Path, version: str, target: str) -> None:
         super().stage(store, staged, version, target)
         binary = self.binary(staged, target)
-        if binary is not None and sys.platform == "darwin":
+        # A cross-target stage must not execute against foreign bytes.
+        if binary is not None and sys.platform == "darwin" and target.startswith("darwin-"):
             from hermes_cli.macos_signing import sign_managed_python
 
             sign_managed_python(binary)
