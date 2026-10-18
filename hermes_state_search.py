@@ -1289,17 +1289,17 @@ class SessionSearchMixin:
 
         # Heal bookkeeping BEFORE deciding whether to demote again.
         self._repair_optimize_bookkeeping()
-        with self._lock:
-            needs_storage_upgrade = self._db_needs_fts_storage_upgrade(self._conn)
-            legacy_layout = self._db_has_legacy_inline_fts(self._conn)
-            projection_pending = self._conn.execute(
+        with self._read_ctx() as conn:
+            needs_storage_upgrade = self._db_needs_fts_storage_upgrade(conn)
+            legacy_layout = self._db_has_legacy_inline_fts(conn)
+            projection_pending = conn.execute(
                 "SELECT 1 FROM state_meta WHERE key IN (?, ?, ?) LIMIT 1",
                 (FTS_PROJECTION_PENDING_KEY, FTS_TRIGRAM_PROJECTION_PENDING_KEY,
                  FTS_CJK_PROJECTION_PENDING_KEY),
             ).fetchone() is not None
             deferred_projection = (
                 not legacy_layout
-                and (projection_pending or _meta_row(self._conn, "fts_optimize_available") is not None)
+                and (projection_pending or _meta_row(conn, "fts_optimize_available") is not None)
             )
         pending = self.get_meta("fts_rebuild_high_water") is not None
         if needs_storage_upgrade and not pending and not deferred_projection:
@@ -1314,8 +1314,8 @@ class SessionSearchMixin:
         self._fts_cjk_reset_if_stale()
         if self._fts_cjk_loaded:
             self._ensure_cjk_schema_committed()
-        with self._lock:
-            projection_pending = bool(self._projection_pending(self._conn))
+        with self._read_ctx() as conn:
+            projection_pending = bool(self._projection_pending(conn))
         if needs_storage_upgrade or projection_pending:
             self._upgrade_projection_surfaces()
 

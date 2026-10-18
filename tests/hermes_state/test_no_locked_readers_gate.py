@@ -95,16 +95,8 @@ def _first_sql_text(call: ast.Call) -> str | None:
     return text.strip()
 
 
-def _is_self_conn_execute(call: ast.Call, aliases: set[str]) -> bool:
-    """Match ``self._conn.execute*`` and ``<alias>.execute*`` where the
-    alias was bound from ``self._conn`` (``conn = self._conn``)."""
-    f = call.func
-    if not (
-        isinstance(f, ast.Attribute)
-        and f.attr in ("execute", "executemany", "executescript")
-    ):
-        return False
-    target = f.value
+def _is_self_conn(target: ast.expr, aliases: set[str]) -> bool:
+    """Match ``self._conn`` and names bound from it (``conn = self._conn``)."""
     if (
         isinstance(target, ast.Attribute)
         and target.attr == "_conn"
@@ -113,6 +105,16 @@ def _is_self_conn_execute(call: ast.Call, aliases: set[str]) -> bool:
     ):
         return True
     return isinstance(target, ast.Name) and target.id in aliases
+
+
+def _is_self_conn_execute(call: ast.Call, aliases: set[str]) -> bool:
+    """Match ``self._conn.execute*`` and ``<alias>.execute*``."""
+    f = call.func
+    return (
+        isinstance(f, ast.Attribute)
+        and f.attr in ("execute", "executemany", "executescript")
+        and _is_self_conn(f.value, aliases)
+    )
 
 
 def _collect_conn_aliases(method: ast.AST) -> set[str]:
@@ -191,7 +193,14 @@ def _scan_locked_readers(
                 # self.<something>() as potentially writing.
                 elif isinstance(inner, ast.Call):
                     f = inner.func
+                    # DDL often runs through helpers (executescript) the scanner
+                    # cannot see into; an explicit commit on the writer proves
+                    # the block staged a write.
                     if (
+                        isinstance(f, ast.Attribute)
+                        and f.attr == "commit"
+                        and _is_self_conn(f.value, aliases)
+                    ) or (
                         isinstance(f, ast.Attribute)
                         and isinstance(f.value, ast.Name)
                         and f.value.id == "self"
@@ -258,6 +267,11 @@ class TestNoPureReadersUnderWriterLock:
             "        with self._lock:\n"
             "            self._conn.execute(query)\n"
             "            self._conn.execute(\"UPDATE t SET x = 2\")\n"
+            "    def innocent_helper_ddl_writer(self):\n"
+            "        with self._lock:\n"
+            "            self._conn.execute(\"SELECT 1\").fetchone()\n"
+            "            self._ensure_schema(self._conn)\n"
+            "            self._conn.commit()\n"
         )
         p = tmp_path / "fake_state.py"
         p.write_text(sabotage, encoding="utf-8")
