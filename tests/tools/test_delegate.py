@@ -295,7 +295,8 @@ class TestDelegateTask(unittest.TestCase):
         from pathlib import Path
 
         with tempfile.TemporaryDirectory() as tmp:
-            profile_db_path = Path(tmp) / "profile-work" / "state.db"
+            # The handle registry keys files by resolved path; macOS tempdirs sit behind /var.
+            profile_db_path = Path(tmp).resolve() / "profile-work" / "state.db"
             profile_db_path.parent.mkdir(parents=True)
             parent = _make_mock_parent(depth=0)
             parent_db = SessionDB(db_path=profile_db_path)

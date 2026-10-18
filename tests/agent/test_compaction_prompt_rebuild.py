@@ -92,7 +92,8 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
         from pathlib import Path
         from agent.system_prompt import build_system_prompt, invalidate_system_prompt
 
-        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-ws-"))
+        # Resolved: macOS tempdirs sit behind the /var symlink, while git and getcwd report /private/var.
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-ws-")).resolve()
         try:
             repo = _init_repo(tmp / "proj", "init commit")
 
@@ -146,7 +147,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
         from pathlib import Path
         from agent.system_prompt import build_system_prompt
 
-        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-cwd-"))
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-cwd-")).resolve()
         try:
             repo1 = _init_repo(tmp / "r1", "init r1")
             repo2 = _init_repo(tmp / "r2", "init r2")
@@ -193,7 +194,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
         from agent.system_prompt import build_system_prompt, invalidate_system_prompt
         from run_agent import AIAgent
 
-        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-boundary-"))
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-boundary-")).resolve()
         try:
             repo = _init_repo(tmp / "proj", "init commit")
             agent = _agent(
@@ -233,7 +234,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
         from pathlib import Path
         from agent.system_prompt import build_system_prompt, invalidate_system_prompt
 
-        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-bind-"))
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-bind-")).resolve()
         old_cwd = os.getcwd()
         try:
             repo = _init_repo(tmp / "proj", "init commit")
@@ -260,7 +261,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
         from pathlib import Path
         from agent.system_prompt import build_system_prompt
 
-        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-resume-"))
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-resume-")).resolve()
         try:
             repo, other = _init_repo(tmp / "proj", "init commit"), _init_repo(tmp / "other", "init other")
 
@@ -290,7 +291,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
         from pathlib import Path
         from agent.system_prompt import build_system_prompt
 
-        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-empty-"))
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-empty-")).resolve()
         try:
             repo = _init_repo(tmp / "proj", "init commit")
             stored = f"Host: x\nUser home directory: /h\nCurrent working directory: {repo}\n\nBODY"
