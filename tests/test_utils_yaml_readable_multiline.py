@@ -1,6 +1,6 @@
 """Preserve the fork's readable multiline YAML contract."""
 
-import yaml
+import hermes_yaml as yaml
 
 from utils import atomic_yaml_write
 
