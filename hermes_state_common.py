@@ -16,6 +16,7 @@ from hermes_state_pidns import persistent_record_pidns_checkable, pid_namespace_
 from agent.skill_commands import AUTO_LOAD_SCAFFOLD_SQL_LIKE, SKILL_EXCERPT_JOINT, SKILL_SCAFFOLD_SQL_LIKE, describe_skill_invocation
 from agent.context_compressor import (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER,
     _MERGED_SUMMARY_DELIMITER, _SUMMARY_END_MARKER)
+from agent.message_sanitization import _sanitize_surrogates
 
 
 # Persisted title provenance: automatic display labels are not user-selected identities.
@@ -349,7 +350,8 @@ def _fts_content_from_stored(content: Any) -> str | None:
     for part in parts:
         if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
             text_parts.append(part["text"])
-    return " ".join(text_parts).replace("\x00", " ")
+    # json.loads revives the \uXXXX escapes _encode_content wrote, so lone surrogates would reach the bind.
+    return _sanitize_surrogates(" ".join(text_parts).replace("\x00", " "))
 
 
 _FTS_NEW_INDEXED_CONTENT_SQL = _fts_indexed_content_sql("new")

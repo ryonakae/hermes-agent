@@ -5813,6 +5813,13 @@ class TestLoneSurrogatePersistence:
         # Surrogate replaced with U+FFFD; the surrounding text is intact.
         assert rows[1]["content"] == "scraped � price"
 
+    def test_append_message_survives_lone_surrogate_in_multimodal_text(self, db):
+        db.create_session("s1", source="cli")
+        content = [{"type": "text", "text": self.DIRTY}]
+        db.append_message("s1", "user", content)
+
+        assert db.get_messages("s1")[0]["content"] == content
+
 
 
 
