@@ -101,6 +101,12 @@ class RangeHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+class _QueueingHTTPServer(HTTPServer):
+    # Parallel range writers queue behind this single-threaded server. Past the default
+    # backlog of 5, macOS resets the extra connects (Errno 54/22) where Linux retries the SYN.
+    request_queue_size = 64
+
+
 @pytest.fixture
 def dl_server():
     RangeHandler.payloads = {}
@@ -110,7 +116,7 @@ def dl_server():
     RangeHandler.no_range = False
     RangeHandler.etags = True
     RangeHandler.chunk = 1 << 20
-    server = HTTPServer(("127.0.0.1", 0), RangeHandler)
+    server = _QueueingHTTPServer(("127.0.0.1", 0), RangeHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
