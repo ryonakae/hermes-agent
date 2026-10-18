@@ -132,7 +132,9 @@ def test_update_probe_children_skip_external_secret_sources(tmp_path):
          "from hermes_cli.update_cmd_validation import _validate_critical_modules_import\n"
          "print('PROBE=' + repr(_validate_critical_modules_import(__import__('os').getcwd())))"],
         capture_output=True, text=True, timeout=180, cwd=REPO_ROOT,
-        env={**os.environ, "HERMES_HOME": str(home)},
+        # An empty runtime dir keeps the probe on this venv, as on CI: a PM-installed checkout's
+        # stamp would pick the store Python, which has no dependency generation for this home.
+        env={**os.environ, "HERMES_HOME": str(home), "HERMES_RUNTIME_DIR": str(tmp_path / "no-store")},
         check=False,
     )
     assert result.returncode == 0, result.stderr
