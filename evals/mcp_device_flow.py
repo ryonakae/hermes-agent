@@ -131,8 +131,11 @@ def run_cli(repo, mode):
                         "fixture.meta.json": '{"issuer":"https://old.example"}'}
             for filename, value in previous.items():
                 (token_dir / filename).write_text(value)
+        # The lazy-install opt-out stays: without it a self-updating checkout syncs a whole
+        # dependency generation for this borrowed home before the CLI can run.
         env = {key: value for key, value in os.environ.items()
-               if not key.startswith("HERMES_") and not any(part in key for part in ("API_KEY", "TOKEN", "SECRET"))}
+               if (not key.startswith("HERMES_") or key == "HERMES_DISABLE_LAZY_INSTALLS")
+               and not any(part in key for part in ("API_KEY", "TOKEN", "SECRET"))}
         env.update(HOME=str(home), HERMES_HOME=str(home), PYTHONPATH=str(repo), PYTHONDONTWRITEBYTECODE="1")
         command = ["reauth", "fixture"] if mode == "preregistered" else ["login", "fixture", "--flow", "device"]
         argv = [sys.executable, "-m", "hermes_cli.main", "mcp", *command]

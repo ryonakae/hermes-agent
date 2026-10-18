@@ -61,8 +61,10 @@ def test_tool_hook_in_a_ticked_job_sees_its_execution_and_none_outside(tmp_path)
             "next_run_at": (now() - timedelta(minutes=1)).isoformat(),
             "enabled": True, "state": "scheduled", "deliver": "local",
             "repeat": {"times": None, "completed": 0}}]}))
+        # The lazy-install opt-out stays: without it a self-updating checkout syncs a whole
+        # dependency generation for this borrowed home before the tick can run.
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("HERMES_", "_HERMES_"))
+               if (not k.startswith(("HERMES_", "_HERMES_")) or k == "HERMES_DISABLE_LAZY_INSTALLS")
                and not k.endswith(("_API_KEY", "_TOKEN"))}
         env.update(HERMES_HOME=str(home), PYTHONPATH=str(Path(__file__).resolve().parents[2]))
         result = subprocess.run([sys.executable, "-c", _TICK], env=env, stdin=subprocess.DEVNULL,

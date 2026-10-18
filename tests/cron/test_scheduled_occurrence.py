@@ -43,10 +43,15 @@ else:
 
 
 def _fire(home, mode):
+    # The lazy-install opt-out stays: without it a self-updating checkout syncs a whole
+    # dependency generation for this borrowed home before the worker can run.
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(('HERMES_', '_HERMES_'))
+           if (not k.startswith(('HERMES_', '_HERMES_')) or k == 'HERMES_DISABLE_LAZY_INSTALLS')
            and not k.endswith(('_API_KEY', '_TOKEN'))}
     env['HERMES_HOME'] = str(home)
+    # An empty runtime dir keeps script jobs on this venv, as on CI: a PM-installed checkout's
+    # stamp would pick the store Python, which has no dependency generation for this home.
+    env['HERMES_RUNTIME_DIR'] = str(home.parent / 'no-store')
     env['PYTHONPATH'] = str(Path(__file__).resolve().parents[2])
     result = subprocess.run([sys.executable, '-c', _FIRE, mode], env=env,
                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90, check=False)
