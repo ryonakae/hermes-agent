@@ -24,6 +24,11 @@ _INTERPRETER_PREFIXES = tuple({
     # checkout's own .venv is not Hermes state; without this every run from a default install
     # trips on its first traceback.
     Path(__file__).resolve().parent.parent,
+} | {
+    # A PM generation venv (<installs>/<key>/{environments,test-environment}/<gen>/venv): the
+    # updater probes the generation for a checkout to decide who owns this interpreter.
+    generation for generation in (Path(sys.prefix).resolve().parent,)
+    if generation.parent.name in ("environments", "test-environment")
 })
 # The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
 # Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes
@@ -56,7 +61,7 @@ class HomeIOGuard:
         self.checking = threading.local()
         self.directories: dict[int, Path] = {}
 
-    def check(self, value, *, dir_fd=None, metadata=False, destructive=False):
+    def check(self, value, *, dir_fd=None, metadata=False, destructive=False, read=False):
         if value is None or isinstance(value, int) or getattr(self.checking, "active", False):
             return
         self.checking.active = True
@@ -90,11 +95,15 @@ class HomeIOGuard:
             # realpath()s the entry itself (is it a Hermes-managed bin dir?), which lstats each of
             # its ancestors. A developer shell puts PM's tool store (~/.hermes/tools/...) on PATH;
             # probing there is command lookup, not reading Hermes state. CI has no such entries.
-            if metadata:
+            # Reading a tool found there (hashing the rg that ``which`` returned) is not either.
+            entries = frozenset()
+            if metadata or read:
                 path = os.environ.get("PATH", "")
                 cwd = os.getcwd() if self._relative_path_entries(path) else None
                 entries = self._path_entries(path, cwd)
-                if os.path.dirname(absolute) in entries or any(_contains(absolute, entry) for entry in entries):
+                if os.path.dirname(absolute) in entries or (
+                    metadata and any(_contains(absolute, entry) for entry in entries)
+                ):
                     return
             # The interpreter's own installation (a PM-managed python under ~/.hermes/tools):
             # stdlib source reads (linecache, traceback) are not Hermes state either, nor is
@@ -110,6 +119,9 @@ class HomeIOGuard:
             if resolved is None:
                 resolved = _normcase(os.path.realpath(absolute))
             if metadata and resolved in roots:
+                return
+            # A fixture symlink onto a tool on PATH (a bin/node pointing at PM's node) resolves to it.
+            if os.path.dirname(resolved) in entries:
                 return
             # A fixture symlink to the running interpreter resolves into its installation.
             for prefix in _INTERPRETER_PREFIX_STRS:
@@ -159,7 +171,7 @@ class HomeIOGuard:
         )
 
     def install(self, monkeypatch):
-        def wrap(module, name, parameters, *, metadata=False, destructive=False):
+        def wrap(module, name, parameters, *, metadata=False, destructive=False, read=False):
             original = getattr(module, name)
 
             @wraps(original)
@@ -167,7 +179,8 @@ class HomeIOGuard:
                 for index, (parameter, descriptor) in enumerate(parameters):
                     value = args[index] if index < len(args) else kwargs.get(parameter)
                     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
-                               destructive=destructive(args, kwargs) if callable(destructive) else destructive)
+                               destructive=destructive(args, kwargs) if callable(destructive) else destructive,
+                               read=read(args, kwargs) if callable(read) else read)
                 return original(*args, **kwargs)
 
             monkeypatch.setattr(module, name, guarded)
@@ -177,7 +190,8 @@ class HomeIOGuard:
             return any(flag in mode for flag in "wax+")
 
         for module in (builtins, io):
-            wrap(module, "open", (("file", None),), destructive=open_writes)
+            wrap(module, "open", (("file", None),), destructive=open_writes,
+                 read=lambda args, kwargs: not open_writes(args, kwargs))
         for name in ("mkdir", "unlink", "remove", "rmdir", "chmod", "utime"):
             wrap(os, name, (("path", "dir_fd"),), destructive=name != "mkdir")
         for name in ("stat", "lstat", "readlink", "access"):

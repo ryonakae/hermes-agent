@@ -22,6 +22,12 @@ from pm.store import current_target, tree_digest
 def tool_store(tmp_path, monkeypatch):
     rg = shutil.which("rg")
     assert rg is not None, "this executable parity test requires ripgrep"
+    # A developer shell finds rg in PM's tool store under the real home, and the store links
+    # published below would resolve there once PATH no longer names it; a private copy does not.
+    host_rg = tmp_path / "host" / "rg"
+    host_rg.parent.mkdir()
+    shutil.copy2(rg, host_rg)
+    rg = str(host_rg)
     version_output = subprocess.run(
         [rg, "--version"], capture_output=True, text=True, check=True, timeout=10,
     ).stdout
