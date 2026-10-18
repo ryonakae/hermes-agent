@@ -252,6 +252,7 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
             ('+', 'tool_call_uids', 'absorbed_message_uids'),
             ('+', 'tool_call_uid', 'tool_call_uids'),
         )),
+        ('17 2026-10-05T10:09Z 4e79702425', (('+', 'fts_content', 'content'),)),
         ),
     ),
     "session_model_usage": _TableHistory(
