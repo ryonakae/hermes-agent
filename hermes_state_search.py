@@ -10,7 +10,7 @@ import logging
 import re
 import sqlite3
 import time
-from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
+from typing import Any, Callable, Collection, Dict, List, Optional
 
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_errors import is_malformed_db_error
@@ -823,7 +823,7 @@ class SessionSearchMixin:
             ).fetchall()
         }
 
-    def _projection_surface_flags(self, conn, pending: set) -> Tuple[bool, bool, bool]:
+    def _projection_surface_flags(self, conn, pending: set) -> tuple[bool, bool, bool]:
         """Return (base, trigram, cjk) surfaces that are both pending and present."""
         exists = {
             row[0] for row in conn.execute(
@@ -841,7 +841,7 @@ class SessionSearchMixin:
             and bool(getattr(self, "_fts_cjk_loaded", False)),
         )
 
-    def _projection_seed_progress(self, conn) -> Tuple[int, int]:
+    def _projection_seed_progress(self, conn) -> tuple[int, int]:
         pending = self._projection_pending(conn)
         surface_key = _projection_surface_key(pending)
         surface_row = _meta_row(conn, _PROJECTION_SURFACES_KEY)
@@ -1044,7 +1044,7 @@ class SessionSearchMixin:
             return False
         return bool(self._execute_write(_do))
 
-    def _projection_publish(self) -> Tuple[bool, bool]:
+    def _projection_publish(self) -> tuple[bool, bool]:
         """Restore complete trigger families and clear only proven-complete fences.
 
         Returns ``(published_any, required_base_is_still_pending)``.  Optional
