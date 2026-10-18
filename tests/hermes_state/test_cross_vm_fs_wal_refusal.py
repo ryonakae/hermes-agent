@@ -28,6 +28,7 @@ NESTED_EXT4 = "614 612 8:2 / /data/native rw,relatime - ext4 /dev/sdb1 rw"
 SPACE_VIRTIOFS = "615 25 0:55 / /mnt/my\\040share rw,relatime - virtiofs share rw"
 
 
+@pytest.mark.platforms("linux")  # mountinfo is Linux-only; detection is a constant False elsewhere
 class TestDetectCrossVmFs:
     @pytest.mark.parametrize("path,expected", [
         ("/data/agent", True),          # fuse.virtiofs bind mount
