@@ -1515,7 +1515,7 @@ class TestWriteProfileMetaDurability:
     def _interrupted_write(profile_dir):
         """Run a ``write_profile_meta`` whose serialization fails mid-call.
 
-        ``utils.atomic_yaml_write`` serializes through ``hermes_yaml.safe_dump``.
+        ``utils.atomic_yaml_write`` serializes through ``hermes_yaml.roundtrip_yaml``.
         Breaking that seam measures durability rather than the choice of writer. A
         scoped ``MonkeyPatch.context`` is used instead of the fixture so the
         patch is reverted immediately, without touching the session-wide env
@@ -1525,7 +1525,7 @@ class TestWriteProfileMetaDurability:
             raise RuntimeError("simulated interruption mid-write")
 
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(yaml, "safe_dump", _boom)
+            mp.setattr(yaml, "roundtrip_yaml", _boom)
             with pytest.raises(RuntimeError):
                 profiles.write_profile_meta(profile_dir, description_auto=True)
 
