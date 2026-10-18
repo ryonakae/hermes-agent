@@ -13,7 +13,10 @@ def test_resume_and_exit_read_without_writing(tmp_path, populated):
     repo = Path(__file__).resolve().parents[2]
     home = tmp_path / "profile"
     home.mkdir()
-    env = {k: os.environ[k] for k in ("PATH", "SYSTEMROOT", "LANG", "TZ") if k in os.environ}
+    # The lazy-install opt-out stays: without it a self-updating checkout completes a source
+    # update for this borrowed home before the reader can run.
+    env = {k: os.environ[k] for k in ("PATH", "SYSTEMROOT", "LANG", "TZ", "HERMES_DISABLE_LAZY_INSTALLS")
+           if k in os.environ}
     env.update(HOME=str(tmp_path), USERPROFILE=str(tmp_path), HERMES_HOME=str(home), PYTHONPATH=str(repo))
     code = '''
 from pathlib import Path

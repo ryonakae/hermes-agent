@@ -10,7 +10,10 @@ def _probe(tmp_path, mode):
     home, state = tmp_path / 'home', tmp_path / 'state'
     home.mkdir(exist_ok=True)
     state.mkdir(exist_ok=True)
-    env = {key: os.environ[key] for key in ('PATH', 'SYSTEMROOT', 'LANG', 'TZ') if key in os.environ}
+    # The lazy-install opt-out stays: without it a self-updating checkout completes a source
+    # update for this borrowed home before the peer can run.
+    env = {key: os.environ[key] for key in ('PATH', 'SYSTEMROOT', 'LANG', 'TZ', 'HERMES_DISABLE_LAZY_INSTALLS')
+           if key in os.environ}
     env.update(HOME=str(home), USERPROFILE=str(home), HERMES_HOME=str(state), PYTHONPATH=str(repo))
     result = subprocess.run([sys.executable, str(Path(__file__).parent / 'fixtures' /
                              'native_ingress_trust_peer.py'), mode], cwd=repo, env=env,

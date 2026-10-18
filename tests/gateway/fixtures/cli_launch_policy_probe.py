@@ -90,7 +90,10 @@ def probe(tmp_path):
     config.write_text(json.dumps(cfg))
     before = config.read_bytes()
     (home / 'SOUL.md').write_text('SOUL_LAUNCH_MARKER')
-    env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'SYSTEMROOT') if k in os.environ}
+    # The lazy-install opt-out stays: without it a self-updating checkout completes a source
+    # update for this borrowed home before the CLI can run.
+    env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'SYSTEMROOT', 'HERMES_DISABLE_LAZY_INSTALLS')
+           if k in os.environ}
     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root))
     sessions, pids = {}, []
     keys = {'left': 'private-left-launch-token', 'right': 'private-right-launch-token'}

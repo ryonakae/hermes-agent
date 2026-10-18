@@ -47,8 +47,11 @@ class Model(BaseHTTPRequestHandler):
 
 
 # Windows children need the system environment (Winsock, temp, PATHEXT); POSIX uses the first three.
+# The lazy-install opt-out passes through: without it a self-updating checkout completes a
+# source update for each child's borrowed home before the child can run.
 CHILD_ENV_KEYS = ('PATH', 'LANG', 'TZ', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'PATHEXT',
-                  'LOCALAPPDATA', 'APPDATA', 'PROGRAMDATA', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE')
+                  'LOCALAPPDATA', 'APPDATA', 'PROGRAMDATA', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE',
+                  'HERMES_DISABLE_LAZY_INSTALLS')
 
 
 def child_env():

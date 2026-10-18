@@ -32,7 +32,10 @@ def test_restore_refuses_live_authority_without_changing_data(tmp_path):
         'auxiliary': {'title_generation': {'enabled': False}},
         'platform_toolsets': {'cli': []},
     }))
-    env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
+    # The lazy-install opt-out stays: without it a self-updating checkout completes a source
+    # update for this borrowed home before the gateway can run.
+    env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED', 'HERMES_DISABLE_LAZY_INSTALLS')
+           if k in os.environ}
     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
                OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)
 
@@ -163,7 +166,8 @@ def test_update_restore_excludes_startup_until_publication(tmp_path, monkeypatch
     try:
         assert arrived.wait(20)
         root = Path(__file__).resolve().parents[2]
-        env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
+        env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED', 'HERMES_DISABLE_LAZY_INSTALLS')
+               if k in os.environ}
         env.update(HOME=str(tmp_path / 'user'), HERMES_HOME=str(home), PYTHONPATH=str(root))
         contender = subprocess.run([sys.executable, '-c',
             "import logging, runpy; logging.basicConfig(level=logging.INFO); runpy.run_module('gateway.run', run_name='__main__')"],
