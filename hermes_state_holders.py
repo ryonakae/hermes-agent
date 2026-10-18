@@ -552,7 +552,9 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                 continue
             for opened in info.get("open_files") or ():
                 path = getattr(opened, "path", "")
-                if path and canonical_sqlite_path(os.path.realpath(path)) in watched:
+                # psutil already reports the kernel-resolved path; resolving it again only lstats
+                # every file every process holds.
+                if path and canonical_sqlite_path(path) in watched:
                     holders.append((pid, path))
     except Exception as exc:
         logger.warning(

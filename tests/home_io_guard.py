@@ -210,3 +210,25 @@ class HomeIOGuard:
 
         monkeypatch.setattr(os, "open", guarded_open)
         monkeypatch.setattr(os, "close", guarded_close)
+
+        try:
+            import psutil
+        except ImportError:
+            return
+        original_isfile_strict = getattr(psutil._psplatform, "isfile_strict", None)
+        if original_isfile_strict is None:
+            return
+
+        # psutil's open_files() stats every kernel-reported path of a process to keep regular
+        # files. On macOS that is the holder scan's descriptor inspection (the /proc/<pid>/fd
+        # carve-out above), and a live gateway's own files under the real home are among them.
+        @wraps(original_isfile_strict)
+        def unguarded_isfile_strict(path):
+            previous = getattr(self.checking, "active", False)
+            self.checking.active = True
+            try:
+                return original_isfile_strict(path)
+            finally:
+                self.checking.active = previous
+
+        monkeypatch.setattr(psutil._psplatform, "isfile_strict", unguarded_isfile_strict)
