@@ -4297,14 +4297,30 @@ class SlackAdapter(BasePlatformAdapter):
         if message_s is None or message_s > floor:
             return False
         previous = event.get("previous_message")
-        if isinstance(previous, dict) and previous.get("text") != message.get("text"):
-            return False
-        if edited_ts:
-            # A user edit's change carries ``edited.ts`` equal to its own ts; an older
-            # ``edited`` block is a past edit riding along on a metadata update.
-            edited_s = _slack_ts_seconds(edited_ts)
+        if isinstance(previous, dict):
+            if "text" in previous and "text" in message and previous["text"] != message["text"]:
+                return False
+            # Use the same non-quoted mention extraction as routing. Missing blocks in
+            # a partial snapshot are not evidence that a mention was newly added.
+            if "blocks" in previous and "blocks" in message:
+                new_block_mentions = (
+                    set(_collect_slack_block_mentions(message["blocks"]))
+                    - set(_collect_slack_block_mentions(previous["blocks"]))
+                )
+                previous_routing_text = _slack_mention_detection_text(previous)
+                if any(mention not in previous_routing_text for mention in new_block_mentions):
+                    return False
+        edited_s = _slack_ts_seconds(edited_ts)
+        if edited_s is not None:
+            previous_edit = previous.get("edited") if isinstance(previous, dict) else None
+            previous_s = _slack_ts_seconds(previous_edit.get("ts")) if isinstance(previous_edit, dict) else None
+            if previous_s is not None and edited_s > previous_s:
+                return False
+            # An edit timestamp survives subsequent metadata updates. Being newer than
+            # startup/eviction is not enough: without a before/after change it must
+            # belong to this event, not an earlier edit of the same message.
             change_s = _slack_ts_seconds(event.get("event_ts") or event.get("ts"))
-            if edited_s is None or change_s is None or edited_s >= min(change_s, floor):
+            if change_s is not None and edited_s >= change_s:
                 return False
         return True
 

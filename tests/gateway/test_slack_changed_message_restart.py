@@ -136,3 +136,77 @@ def test_edit_made_after_the_restart_still_reaches_the_agent():
 
     assert len(delivered) == 1
     assert delivered[0].message_id == message_ts
+
+
+@pytest.mark.parametrize("with_previous", [False, True])
+def test_metadata_after_an_evicted_post_restart_edit_is_not_redelivered(monkeypatch, with_previous):
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    delivered = []
+    adapter = _adapter(delivered)
+    adapter._PROCESSED_MESSAGE_TS_MAX = 2
+    monkeypatch.setattr(time, "time", lambda: 1100.0)
+    edit = _changed_event("500.000000", previous_text="summarize the release notes", edited_ts="1100.000000")
+    _run(adapter, edit)
+    assert len(delivered) == 1
+    for now, original_ts in ((1110.0, "600.000000"), (1120.0, "700.000000")):
+        monkeypatch.setattr(time, "time", lambda now=now: now)
+        adapter._remember_processed_message_ts(original_ts)
+    assert "500.000000" not in adapter._processed_message_ts
+    monkeypatch.setattr(time, "time", lambda: 1200.0)
+    metadata = _changed_event("500.000000", edited_ts="1100.000000")
+    if with_previous:
+        metadata["previous_message"] = dict(edit["message"])
+    _run(adapter, metadata)
+    assert len(delivered) == 1
+
+
+@pytest.mark.parametrize("new_mention", [True, False])
+def test_old_block_only_mention_change_is_distinguished_from_metadata(new_mention):
+    delivered = []
+    adapter = _adapter(delivered)
+    text = "summarize the release notes"
+    event = _changed_event(_slack_ts(time.time() - 600), text=text, previous_text=text)
+    blocks = [{"type": "rich_text", "elements": [{
+        "type": "rich_text_section", "elements": [{"type": "user", "user_id": BOT}]}]}]
+    event["message"]["blocks"] = blocks
+    event["previous_message"]["blocks"] = [] if new_mention else blocks
+    _run(adapter, event)
+    assert len(delivered) == int(new_mention)
+
+
+def test_repeated_flat_mention_in_current_blocks_is_not_new_mention():
+    delivered = []
+    adapter = _adapter(delivered)
+    event = _changed_event(
+        _slack_ts(time.time() - 600), text=TEXT, previous_text=TEXT)
+    blocks = [{"type": "rich_text", "elements": [{
+        "type": "rich_text_section", "elements": [{"type": "user", "user_id": BOT}]}]}]
+    event["message"]["blocks"] = blocks
+    event["previous_message"]["blocks"] = []
+
+    _run(adapter, event)
+
+    assert len(delivered) == 0
+
+
+@pytest.mark.parametrize("with_previous", [False, True])
+def test_current_edit_timestamp_still_allows_an_old_message(with_previous):
+    delivered = []
+    adapter = _adapter(delivered)
+    event = _changed_event(_slack_ts(time.time() - 600))
+    event["message"]["edited"] = {"user": USER, "ts": event["event_ts"]}
+    if with_previous:
+        event["previous_message"] = {"text": TEXT}
+    _run(adapter, event)
+    assert len(delivered) == 1
+
+
+def test_advancing_edit_timestamp_allows_delayed_edit_event(monkeypatch):
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    delivered = []
+    adapter = _adapter(delivered)
+    monkeypatch.setattr(time, "time", lambda: 1200.0)
+    event = _changed_event("500.000000", previous_text=TEXT, edited_ts="1100.000000")
+    event["previous_message"]["edited"] = {"user": USER, "ts": "900.000000"}
+    _run(adapter, event)
+    assert len(delivered) == 1
